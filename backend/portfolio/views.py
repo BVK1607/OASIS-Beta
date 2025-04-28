@@ -3,8 +3,8 @@ from rest_framework import viewsets, status
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from django.shortcuts import get_object_or_404
-from .models import Portfolio, Holding, NAVSnapshot, RebalanceSnapshot
-from .serializers import PortfolioSerializer, HoldingSerializer, NAVSnapshotSerializer, RebalanceSnapshotSerializer
+from .models import Portfolio, Holding, NAVSnapshot, RebalanceSnapshot, TradeHistory, HoldingsReturnSnapshot, BenchmarkReturnSnapshot
+from .serializers import PortfolioSerializer, HoldingSerializer, NAVSnapshotSerializer, RebalanceSnapshotSerializer, TradeHistorySerializer, HoldingsReturnSnapshotSerializer, BenchmarkReturnSnapshotSerializer
 from .market_data import get_market_price
 import pandas as pd
 import yfinance as yf
@@ -15,6 +15,8 @@ import logging
 from django.utils import timezone
 from decimal import Decimal
 from collections import defaultdict
+from rest_framework import filters
+from rest_framework.permissions import AllowAny
 
 logger = logging.getLogger(__name__)
 
@@ -380,6 +382,20 @@ class PortfolioViewSet(viewsets.ModelViewSet):
         serializer = RebalanceSnapshotSerializer(snapshots, many=True)
         return Response(serializer.data)
 
+    @action(detail=True, methods=['get'])
+    def nav_history(self, request, pk=None):
+        portfolio = self.get_object()
+        nav_snapshots = NAVSnapshot.objects.filter(portfolio=portfolio).order_by('date')
+        serializer = NAVSnapshotSerializer(nav_snapshots, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['get'])
+    def holdings_returns(self, request, pk=None):
+        portfolio = self.get_object()
+        holding_returns = HoldingsReturnSnapshot.objects.filter(portfolio=portfolio).order_by('ticker', 'date')
+        serializer = HoldingsReturnSnapshotSerializer(holding_returns, many=True)
+        return Response(serializer.data)
+
 class HoldingViewSet(viewsets.ModelViewSet):
     """
     ViewSet for Holding model operations.
@@ -439,7 +455,7 @@ class HoldingViewSet(viewsets.ModelViewSet):
             )
 
     def perform_create(self, serializer):
-        """Set market value equal to book cost for cash positions"""
+        """Set market value equal to book cost for cash positions and create TradeHistory record"""
         try:
             logger.info("Starting perform_create")
             holding = serializer.save()
@@ -454,13 +470,38 @@ class HoldingViewSet(viewsets.ModelViewSet):
             else:
                 logger.info("Processing non-cash position")
                 holding.update_market_price()
-                
+            
+            # --- Create TradeHistory record ---
+            try:
+                # Calculate portfolio_weight_change
+                total_market_value = holding.portfolio.total_market_value or 0
+                if total_market_value > 0 and holding.quantity and holding.current_price:
+                    weight_change = (holding.quantity * holding.current_price) / total_market_value * 100
+                else:
+                    weight_change = None
+                TradeHistory.objects.create(
+                    portfolio=holding.portfolio,
+                    trade_type='Buy',
+                    ticker=holding.ticker or '',
+                    isin=holding.isin or '',
+                    asset_class=holding.asset_class,
+                    quantity=holding.quantity or 0,
+                    price_at_trade=holding.current_price or holding.book_cost or 0,
+                    book_cost=holding.book_cost or 0,
+                    gross_amount=holding.book_cost or 0,
+                    cash_flow_impact=-(abs((holding.quantity or 0) * (holding.current_price or holding.book_cost or 0))),
+                    currency=holding.currency,
+                    portfolio_weight_change=weight_change,
+                    notes='Auto-generated on holding creation.'
+                )
+            except Exception as e:
+                logger.error(f"Failed to create TradeHistory record: {str(e)}")
         except Exception as e:
             logger.error(f"Error in perform_create: {str(e)}", exc_info=True)
             raise
 
     def perform_update(self, serializer):
-        """Update market value after updating a holding"""
+        """Update market value after updating a holding and create TradeHistory record"""
         holding = serializer.save()
         if holding.asset_class == 'Cash':
             holding.market_value = holding.book_cost
@@ -469,6 +510,30 @@ class HoldingViewSet(viewsets.ModelViewSet):
             holding.save()
         else:
             holding.update_market_price()
+        # --- Create TradeHistory record for adjustment ---
+        try:
+            total_market_value = holding.portfolio.total_market_value or 0
+            if total_market_value > 0 and holding.quantity and holding.current_price:
+                weight_change = (holding.quantity * holding.current_price) / total_market_value * 100
+            else:
+                weight_change = None
+            TradeHistory.objects.create(
+                portfolio=holding.portfolio,
+                trade_type='Adjust',
+                ticker=holding.ticker or '',
+                isin=holding.isin or '',
+                asset_class=holding.asset_class,
+                quantity=holding.quantity or 0,
+                price_at_trade=holding.current_price or holding.book_cost or 0,
+                book_cost=holding.book_cost or 0,
+                gross_amount=holding.book_cost or 0,
+                cash_flow_impact=(holding.quantity or 0) * (holding.current_price or holding.book_cost or 0),
+                currency=holding.currency,
+                portfolio_weight_change=weight_change,
+                notes='Auto-generated on holding update.'
+            )
+        except Exception as e:
+            logger.error(f"Failed to create TradeHistory record on update: {str(e)}")
         return holding
 
     @action(detail=True, methods=['post'])
@@ -508,3 +573,24 @@ class NAVSnapshotViewSet(viewsets.ModelViewSet):
     """
     queryset = NAVSnapshot.objects.all()
     serializer_class = NAVSnapshotSerializer
+
+# --- TradeHistoryViewSet ---
+class TradeHistoryViewSet(viewsets.ModelViewSet):
+    serializer_class = TradeHistorySerializer
+    permission_classes = [AllowAny]
+    filter_backends = [filters.OrderingFilter, filters.SearchFilter]
+    ordering = ['-date']
+    search_fields = ['trade_type', 'ticker', 'isin', 'asset_class', 'currency']
+
+    def get_queryset(self):
+        queryset = TradeHistory.objects.all()
+        portfolio_id = self.request.query_params.get('portfolio_id')
+        trade_type = self.request.query_params.get('trade_type')
+        year = self.request.query_params.get('year')
+        if portfolio_id:
+            queryset = queryset.filter(portfolio_id=portfolio_id)
+        if trade_type:
+            queryset = queryset.filter(trade_type=trade_type)
+        if year:
+            queryset = queryset.filter(date__year=year)
+        return queryset.order_by('-date')

@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Portfolio, Holding, NAVSnapshot, RebalanceSnapshot
+from .models import Portfolio, Holding, NAVSnapshot, RebalanceSnapshot, TradeHistory, HoldingsReturnSnapshot, BenchmarkReturnSnapshot
 from decimal import Decimal
 from datetime import datetime
 
@@ -11,12 +11,12 @@ class HoldingSerializer(serializers.ModelSerializer):
     class Meta:
         model = Holding
         fields = [
-            'id', 'portfolio', 'asset_class', 'isin', 'ticker',
+            'id', 'portfolio', 'asset_class', 'isin', 'name', 'ticker',
             'quantity', 'book_cost', 'currency', 'trade_date',
             'current_price', 'market_value', 'last_price_update'
         ]
         read_only_fields = [
-            'id', 'current_price', 'market_value', 'last_price_update'
+            'id', 'current_price', 'market_value', 'last_price_update', 'name'
         ]
 
     def validate(self, data):
@@ -133,7 +133,20 @@ class HoldingSerializer(serializers.ModelSerializer):
 class NAVSnapshotSerializer(serializers.ModelSerializer):
     class Meta:
         model = NAVSnapshot
-        fields = ['id', 'portfolio', 'date', 'nav']
+        fields = ['id', 'portfolio', 'date', 'nav', 'daily_return']
+        read_only_fields = ['id']
+
+class HoldingsReturnSnapshotSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = HoldingsReturnSnapshot
+        fields = ['id', 'portfolio', 'ticker', 'date', 'daily_return']
+        read_only_fields = ['id']
+
+class BenchmarkReturnSnapshotSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BenchmarkReturnSnapshot
+        fields = ['id', 'benchmark_name', 'date', 'daily_return']
+        read_only_fields = ['id']
 
 class PortfolioSerializer(serializers.ModelSerializer):
     creation_date = serializers.DateField(
@@ -231,3 +244,16 @@ class RebalanceSnapshotSerializer(serializers.ModelSerializer):
         if abs(current_sum - 100) > 0.5:
             raise serializers.ValidationError({'current_weights': 'Current weights must sum to approximately 100%.'})
         return data 
+
+# --- TradeHistorySerializer ---
+
+class TradeHistorySerializer(serializers.ModelSerializer):
+    date = serializers.DateTimeField(format="%Y-%m-%dT%H:%M:%S", read_only=True)
+    class Meta:
+        model = TradeHistory
+        fields = [
+            'id', 'portfolio', 'date', 'trade_type', 'ticker', 'isin', 'asset_class',
+            'quantity', 'price_at_trade', 'book_cost', 'gross_amount', 'cash_flow_impact',
+            'currency', 'portfolio_weight_change', 'notes'
+        ]
+        read_only_fields = ['id', 'date', 'gross_amount', 'cash_flow_impact'] 

@@ -91,6 +91,8 @@ class Holding(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    name = models.CharField(max_length=128, blank=True, null=True)
+
     class Meta:
         # Only enforce unique constraint for non-cash positions
         constraints = [
@@ -126,7 +128,7 @@ class Holding(models.Model):
             # Clear other fields for cash positions
             self.isin = None
             self.ticker = None
-            self.quantity = None
+            self.quantity = 1
         else:
             # For non-cash assets, validate required fields
             if not self.isin:
@@ -155,11 +157,13 @@ class Holding(models.Model):
                 # Get stock info
                 stock = yf.Ticker(self.ticker)
                 current_price = stock.info.get('regularMarketPrice')
-                
+                short_name = stock.info.get('shortName')
                 if current_price:
                     self.current_price = Decimal(str(current_price))
                     self.market_value = self.current_price * self.quantity
                     self.last_price_update = timezone.now()
+                    if short_name:
+                        self.name = short_name
                     self.save()
                     return True
             except Exception as e:
@@ -178,14 +182,49 @@ class Holding(models.Model):
 class NAVSnapshot(models.Model):
     portfolio = models.ForeignKey(Portfolio, related_name='nav_snapshots', on_delete=models.CASCADE)
     date = models.DateField()
-    nav = models.DecimalField(max_digits=15, decimal_places=6)
+    nav = models.DecimalField(max_digits=20, decimal_places=4)
+    daily_return = models.DecimalField(max_digits=10, decimal_places=6, null=True)
 
     class Meta:
         unique_together = ('portfolio', 'date')
+        indexes = [
+            models.Index(fields=['portfolio', 'date']),
+        ]
         ordering = ['date']
 
     def __str__(self):
         return f"{self.portfolio.name} NAV on {self.date}"
+
+class HoldingsReturnSnapshot(models.Model):
+    portfolio = models.ForeignKey(Portfolio, on_delete=models.CASCADE)
+    ticker = models.CharField(max_length=20)
+    date = models.DateField()
+    daily_return = models.DecimalField(max_digits=10, decimal_places=6)
+
+    class Meta:
+        unique_together = ('portfolio', 'ticker', 'date')
+        indexes = [
+            models.Index(fields=['portfolio', 'ticker', 'date']),
+        ]
+        ordering = ['portfolio', 'ticker', 'date']
+
+    def __str__(self):
+        return f"{self.ticker} return for {self.portfolio.name} on {self.date}"
+
+class BenchmarkReturnSnapshot(models.Model):
+    benchmark_name = models.CharField(max_length=50)
+    date = models.DateField()
+    daily_return = models.DecimalField(max_digits=10, decimal_places=6)
+
+    class Meta:
+        unique_together = ('benchmark_name', 'date')
+        indexes = [
+            models.Index(fields=['benchmark_name', 'date']),
+        ]
+        ordering = ['benchmark_name', 'date']
+
+    def __str__(self):
+        return f"{self.benchmark_name} return on {self.date}"
 
 class RebalanceSnapshot(models.Model):
     portfolio = models.ForeignKey(Portfolio, on_delete=models.CASCADE, related_name='rebalance_snapshots')
@@ -198,3 +237,41 @@ class RebalanceSnapshot(models.Model):
 
     def __str__(self):
         return f"RebalanceSnapshot for {self.portfolio.name} at {self.date_created}"
+
+# --- TradeHistory model ---
+class TradeHistory(models.Model):
+    TRADE_TYPE_CHOICES = [
+        ("Buy", "Buy"),
+        ("Sell", "Sell"),
+        ("Add", "Add"),
+        ("Adjust", "Adjust"),
+        ("Dividend", "Dividend"),
+    ]
+    portfolio = models.ForeignKey(Portfolio, on_delete=models.CASCADE, related_name='trade_history')
+    date = models.DateTimeField(auto_now_add=True)
+    trade_type = models.CharField(max_length=16, choices=TRADE_TYPE_CHOICES)
+    ticker = models.CharField(max_length=10)
+    isin = models.CharField(max_length=12, blank=True, null=True)
+    asset_class = models.CharField(max_length=20)
+    quantity = models.DecimalField(max_digits=15, decimal_places=4)
+    price_at_trade = models.DecimalField(max_digits=15, decimal_places=4)
+    book_cost = models.DecimalField(max_digits=15, decimal_places=2)
+    gross_amount = models.DecimalField(max_digits=15, decimal_places=2)
+    cash_flow_impact = models.DecimalField(max_digits=15, decimal_places=2)
+    currency = models.CharField(max_length=3)
+    portfolio_weight_change = models.DecimalField(max_digits=7, decimal_places=4, blank=True, null=True)
+    notes = models.TextField(blank=True, null=True)
+
+    def save(self, *args, **kwargs):
+        # Calculate cash_flow_impact: negative for buys, positive for sells
+        if self.trade_type == "Buy":
+            self.cash_flow_impact = -abs(self.quantity * self.price_at_trade)
+        elif self.trade_type == "Sell":
+            self.cash_flow_impact = abs(self.quantity * self.price_at_trade)
+        else:
+            self.cash_flow_impact = self.quantity * self.price_at_trade
+        self.gross_amount = self.book_cost  # For now, same as book_cost
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.trade_type} {self.ticker} ({self.quantity}) on {self.date.strftime('%Y-%m-%d %H:%M')} for {self.portfolio.name}"

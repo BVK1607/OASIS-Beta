@@ -3,6 +3,7 @@ import yfinance as yf
 from decimal import Decimal
 from typing import List
 from .models import Holding
+import pandas as pd
 
 def update_market_prices(holdings: List[Holding]) -> List[Holding]:
     """
@@ -43,6 +44,20 @@ def get_market_price(ticker: str) -> Decimal:
         print(f"Error fetching price for {ticker}: {str(e)}")
     
     return None
+
+def get_historical_prices(ticker: str, start_date, end_date) -> pd.Series:
+    """
+    Fetch historical daily close prices for a ticker from Yahoo Finance.
+    Returns a pandas Series indexed by date.
+    """
+    try:
+        yf_ticker = yf.Ticker(ticker)
+        hist = yf_ticker.history(start=start_date, end=end_date)
+        if not hist.empty:
+            return hist['Close']
+    except Exception as e:
+        print(f"Error fetching historical prices for {ticker}: {str(e)}")
+    return pd.Series(dtype='float64')
 
 # TODO: Implement real market data integration
 # def get_market_price(isin: str, ticker: str) -> Decimal:

@@ -92,4 +92,48 @@ class Migration(migrations.Migration):
                 "ordering": ["-trade_date"],
             },
         ),
+        migrations.CreateModel(
+            name="NAVSnapshot",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
+                ("portfolio", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="nav_snapshots", to="portfolio.portfolio")),
+                ("date", models.DateField()),
+                ("nav", models.DecimalField(decimal_places=4, max_digits=20)),
+                ("daily_return", models.DecimalField(decimal_places=6, max_digits=10, null=True)),
+            ],
+            options={
+                "unique_together": {('portfolio', 'date')},
+                "ordering": ["date"],
+                "indexes": [models.Index(fields=["portfolio", "date"])],
+            },
+        ),
+        migrations.CreateModel(
+            name="HoldingsReturnSnapshot",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
+                ("portfolio", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, to="portfolio.portfolio")),
+                ("ticker", models.CharField(max_length=20)),
+                ("date", models.DateField()),
+                ("daily_return", models.DecimalField(decimal_places=6, max_digits=10)),
+            ],
+            options={
+                "unique_together": {('portfolio', 'ticker', 'date')},
+                "ordering": ["portfolio", "ticker", "date"],
+                "indexes": [models.Index(fields=["portfolio", "ticker", "date"])],
+            },
+        ),
+        migrations.CreateModel(
+            name="BenchmarkReturnSnapshot",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
+                ("benchmark_name", models.CharField(max_length=50)),
+                ("date", models.DateField()),
+                ("daily_return", models.DecimalField(decimal_places=6, max_digits=10)),
+            ],
+            options={
+                "unique_together": {('benchmark_name', 'date')},
+                "ordering": ["benchmark_name", "date"],
+                "indexes": [models.Index(fields=["benchmark_name", "date"])],
+            },
+        ),
     ]
