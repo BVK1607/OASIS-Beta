@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Portfolio, Holding, NAVSnapshot
+from .models import Portfolio, Holding, PortfolioNAV, HoldingReturn, BenchmarkReturn, RebalancePlan, TradeHistory
 
 @admin.register(Portfolio)
 class PortfolioAdmin(admin.ModelAdmin):
@@ -15,8 +15,33 @@ class HoldingAdmin(admin.ModelAdmin):
     search_fields = ('isin', 'ticker')
     ordering = ('-created_at',)
 
-@admin.register(NAVSnapshot)
-class NAVSnapshotAdmin(admin.ModelAdmin):
+@admin.register(PortfolioNAV)
+class PortfolioNAVAdmin(admin.ModelAdmin):
     list_display = ('id', 'portfolio', 'date', 'nav')
     list_filter = ('portfolio', 'date')
+    ordering = ('-date',)
+
+@admin.register(HoldingReturn)
+class HoldingReturnAdmin(admin.ModelAdmin):
+    list_display = ('id', 'portfolio', 'ticker', 'date', 'daily_return')
+    list_filter = ('portfolio', 'ticker', 'date')
+    ordering = ('portfolio', 'ticker', 'date')
+
+@admin.register(BenchmarkReturn)
+class BenchmarkReturnAdmin(admin.ModelAdmin):
+    list_display = ('id', 'benchmark_name', 'date', 'daily_return')
+    list_filter = ('benchmark_name', 'date')
+    ordering = ('benchmark_name', 'date')
+
+@admin.register(RebalancePlan)
+class RebalancePlanAdmin(admin.ModelAdmin):
+    list_display = ('id', 'portfolio', 'date_created', 'executed')
+    list_filter = ('portfolio', 'executed')
+    ordering = ('-date_created',)
+
+@admin.register(TradeHistory)
+class TradeHistoryAdmin(admin.ModelAdmin):
+    list_display = ('id', 'portfolio', 'date', 'trade_type', 'ticker', 'quantity', 'price_at_trade', 'book_cost', 'gross_amount', 'cash_flow_impact', 'currency')
+    list_filter = ('portfolio', 'trade_type', 'currency')
+    search_fields = ('ticker', 'isin')
     ordering = ('-date',)

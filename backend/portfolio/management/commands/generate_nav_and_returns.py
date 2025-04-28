@@ -4,17 +4,23 @@ from django.db import transaction
 from django.utils import timezone
 from datetime import timedelta, date
 from decimal import Decimal
-from portfolio.models import Portfolio, Holding, NAVSnapshot, HoldingsReturnSnapshot
+from portfolio.models import Portfolio, Holding, PortfolioNAV, HoldingReturn
 from portfolio.market_data import get_historical_prices
 
 logger = logging.getLogger(__name__)
 
-#class Command(BaseCommand):
+class Command(BaseCommand):
     help = 'Generate 5 years of historical NAV and holdings returns for all portfolios.'
+
+    def add_arguments(self, parser):
+        parser.add_argument('--today', action='store_true', help='Only calculate and save NAV for today')
 
     def handle(self, *args, **options):
         today = timezone.now().date()
-        start_date = today - timedelta(days=2*365)
+        if options.get('today'):
+            start_date = today
+        else:
+            start_date = today - timedelta(days=5*365)
         for portfolio in Portfolio.objects.all():
             self.stdout.write(f"Processing portfolio: {portfolio.name}")
             try:
@@ -24,14 +30,11 @@ logger = logging.getLogger(__name__)
                 continue
 
     def generate_portfolio_history(self, portfolio, start_date, end_date):
-        # Gather all holdings for this portfolio
         holdings = list(portfolio.holdings.all())
         if not holdings:
             logger.info(f"No holdings for portfolio {portfolio.id}")
             return
-        # Build a dict: ticker -> holding
         ticker_to_holding = {h.ticker: h for h in holdings if h.ticker}
-        # For each holding, fetch historical prices from trade_date onwards
         price_data = {}
         for holding in holdings:
             if not holding.ticker:
@@ -43,7 +46,6 @@ logger = logging.getLogger(__name__)
             except Exception as e:
                 logger.error(f"Error fetching prices for {holding.ticker}: {e}")
                 continue
-        # Build date range
         all_dates = set()
         for prices in price_data.values():
             all_dates.update(prices.index.date)
@@ -51,7 +53,6 @@ logger = logging.getLogger(__name__)
         if not all_dates:
             logger.info(f"No price data for portfolio {portfolio.id}")
             return
-        # Calculate NAV and returns
         nav_snapshots = []
         holding_return_snapshots = []
         prev_nav = None
@@ -60,7 +61,6 @@ logger = logging.getLogger(__name__)
             total_value = Decimal('0')
             for holding in holdings:
                 if not holding.ticker:
-                    # Cash: use book_cost if trade_date <= d
                     if holding.asset_class == 'Cash' and holding.trade_date <= d:
                         total_value += holding.book_cost
                     continue
@@ -74,14 +74,13 @@ logger = logging.getLogger(__name__)
             daily_return = None
             if prev_nav is not None and prev_nav > 0:
                 daily_return = (nav - prev_nav) / prev_nav
-            nav_snapshots.append(NAVSnapshot(
+            nav_snapshots.append(PortfolioNAV(
                 portfolio=portfolio,
                 date=d,
                 nav=nav.quantize(Decimal('0.0001')),
                 daily_return=daily_return.quantize(Decimal('0.000001')) if daily_return is not None else None
             ))
             prev_nav = nav
-        # Calculate holdings daily returns
         for ticker, prices in price_data.items():
             prev_price = None
             for d in all_dates:
@@ -92,18 +91,16 @@ logger = logging.getLogger(__name__)
                 if prev_price is not None and prev_price > 0:
                     daily_return = (price - prev_price) / prev_price
                 if daily_return is not None:
-                    holding_return_snapshots.append(HoldingsReturnSnapshot(
+                    holding_return_snapshots.append(HoldingReturn(
                         portfolio=portfolio,
                         ticker=ticker,
                         date=d,
                         daily_return=daily_return.quantize(Decimal('0.000001'))
                     ))
                 prev_price = price
-        # Remove existing records for this portfolio and date range to avoid duplicates
-        NAVSnapshot.objects.filter(portfolio=portfolio, date__range=(all_dates[0], all_dates[-1])).delete()
-        HoldingsReturnSnapshot.objects.filter(portfolio=portfolio, date__range=(all_dates[0], all_dates[-1])).delete()
-        # Bulk insert
+        PortfolioNAV.objects.filter(portfolio=portfolio, date__range=(all_dates[0], all_dates[-1])).delete()
+        HoldingReturn.objects.filter(portfolio=portfolio, date__range=(all_dates[0], all_dates[-1])).delete()
         with transaction.atomic():
-            NAVSnapshot.objects.bulk_create(nav_snapshots, batch_size=500)
-            HoldingsReturnSnapshot.objects.bulk_create(holding_return_snapshots, batch_size=1000)
+            PortfolioNAV.objects.bulk_create(nav_snapshots, batch_size=500)
+            HoldingReturn.objects.bulk_create(holding_return_snapshots, batch_size=1000)
         logger.info(f"Inserted {len(nav_snapshots)} NAV and {len(holding_return_snapshots)} holding return snapshots for portfolio {portfolio.id}") 

@@ -3,8 +3,8 @@ from rest_framework import viewsets, status
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from django.shortcuts import get_object_or_404
-from .models import Portfolio, Holding, NAVSnapshot, RebalanceSnapshot, TradeHistory, HoldingsReturnSnapshot, BenchmarkReturnSnapshot
-from .serializers import PortfolioSerializer, HoldingSerializer, NAVSnapshotSerializer, RebalanceSnapshotSerializer, TradeHistorySerializer, HoldingsReturnSnapshotSerializer, BenchmarkReturnSnapshotSerializer
+from .models import Portfolio, Holding, PortfolioNAV, RebalancePlan, TradeHistory, HoldingReturn, BenchmarkReturn
+from .serializers import PortfolioSerializer, HoldingSerializer, PortfolioNAVSerializer, RebalancePlanSerializer, TradeHistorySerializer, HoldingReturnSerializer, BenchmarkReturnSerializer, BenchmarkListSerializer, BenchmarkReturnChartSerializer
 from .market_data import get_market_price
 import pandas as pd
 import yfinance as yf
@@ -17,6 +17,8 @@ from decimal import Decimal
 from collections import defaultdict
 from rest_framework import filters
 from rest_framework.permissions import AllowAny
+import numpy as np
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +114,7 @@ class PortfolioViewSet(viewsets.ModelViewSet):
                 if use_modern:
                     # Try to parse date in multiple formats
                     trade_date = str(row['trade_date'])
-                    for fmt in ('%d-%m-%Y', '%d/%m/%Y', '%Y-%m-%d'):
+                    for fmt in ('%d/%m/%Y', '%d-%m-%Y', '%Y-%m-%d'):
                         try:
                             trade_date_obj = datetime.strptime(trade_date, fmt).date()
                             break
@@ -133,7 +135,7 @@ class PortfolioViewSet(viewsets.ModelViewSet):
                 else:
                     # Try to parse date in multiple formats
                     trade_date = str(row['Trade Date'])
-                    for fmt in ('%d-%m-%Y', '%d/%m/%Y', '%Y-%m-%d'):
+                    for fmt in ('%d/%m/%Y', '%d-%m-%Y', '%Y-%m-%d'):
                         try:
                             trade_date_obj = datetime.strptime(trade_date, fmt).date()
                             break
@@ -154,6 +156,23 @@ class PortfolioViewSet(viewsets.ModelViewSet):
                 holdings.append(holding)
             with transaction.atomic():
                 Holding.objects.bulk_create(holdings)
+                # Create TradeHistory records for each holding (ensure date is set)
+                for holding in holdings:
+                    TradeHistory.objects.create(
+                        portfolio=holding.portfolio,
+                        trade_type='Buy',
+                        ticker=holding.ticker or '',
+                        isin=holding.isin or '',
+                        asset_class=holding.asset_class,
+                        quantity=holding.quantity or 0,
+                        price_at_trade=holding.book_cost or 0,
+                        book_cost=holding.book_cost or 0,
+                        gross_amount=holding.book_cost or 0,
+                        cash_flow_impact=-(abs((holding.quantity or 0) * (holding.book_cost or 0))),
+                        currency=holding.currency,
+                        portfolio_weight_change=None,
+                        notes='Auto-generated from CSV upload.'
+                    )
             return Response(
                 {'message': f'Successfully uploaded {len(holdings)} holdings'},
                 status=status.HTTP_201_CREATED
@@ -169,25 +188,23 @@ class PortfolioViewSet(viewsets.ModelViewSet):
         overview = []
         total_market_value = 0
         holding_data = []
+        missing_prices = False
         for holding in holdings:
-            try:
-                ticker = yf.Ticker(holding.ticker)
-                price = ticker.history(period='1d')['Close'][-1]
-                market_value = float(holding.quantity) * float(price)
-                unrealized_return = (float(price) - float(holding.book_cost)) * float(holding.quantity)
-                holding_data.append({
-                    'isin': holding.isin,
-                    'ticker': holding.ticker,
-                    'quantity': holding.quantity,
-                    'book_cost': holding.book_cost,
-                    'trade_date': holding.trade_date,
-                    'market_price': price,
-                    'market_value': market_value,
-                    'unrealized_return': unrealized_return
-                })
-                total_market_value += market_value
-            except Exception:
-                continue
+            if holding.current_price is None or holding.market_value is None:
+                missing_prices = True
+            market_value = float(holding.market_value) if holding.market_value is not None else 0
+            unrealized_return = (float(holding.current_price) - float(holding.book_cost)) * float(holding.quantity) if holding.current_price is not None else 0
+            holding_data.append({
+                'isin': holding.isin,
+                'ticker': holding.ticker,
+                'quantity': holding.quantity,
+                'book_cost': holding.book_cost,
+                'trade_date': holding.trade_date,
+                'market_price': holding.current_price,
+                'market_value': market_value,
+                'unrealized_return': unrealized_return
+            })
+            total_market_value += market_value
         # Calculate weights
         for h in holding_data:
             h['weight'] = (h['market_value'] / total_market_value) * 100 if total_market_value > 0 else 0
@@ -196,14 +213,17 @@ class PortfolioViewSet(viewsets.ModelViewSet):
         total_unrealized = sum([h['unrealized_return'] for h in holding_data])
         portfolio_return = (total_unrealized / total_book_cost) * 100 if total_book_cost > 0 else 0
         # NAV time series
-        nav_snapshots = NAVSnapshot.objects.filter(portfolio=portfolio).order_by('date')
+        nav_snapshots = PortfolioNAV.objects.filter(portfolio=portfolio).order_by('date')
         nav_series = [{'date': nav.date, 'nav': nav.nav} for nav in nav_snapshots]
-        return Response({
+        response = {
             'holdings': holding_data,
             'total_market_value': total_market_value,
             'portfolio_return': portfolio_return,
             'nav_series': nav_series
-        })
+        }
+        if missing_prices:
+            response['warning'] = 'Some holdings are missing market prices. Please refresh prices.'
+        return Response(response)
 
     @action(detail=True, methods=['post'])
     def update_prices(self, request, pk=None):
@@ -319,9 +339,9 @@ class PortfolioViewSet(viewsets.ModelViewSet):
             for n in nav_history:
                 n['nav'] = (n['nav'] / base) * 100
         # Store NAV snapshots
-        NAVSnapshot.objects.filter(portfolio=portfolio).delete()
-        NAVSnapshot.objects.bulk_create([
-            NAVSnapshot(portfolio=portfolio, date=n['date'], nav=n['nav']) for n in nav_history if n['nav'] > 0
+        PortfolioNAV.objects.filter(portfolio=portfolio).delete()
+        PortfolioNAV.objects.bulk_create([
+            PortfolioNAV(portfolio=portfolio, date=n['date'], nav=n['nav']) for n in nav_history if n['nav'] > 0
         ])
 
     @action(detail=True, methods=['post'])
@@ -368,33 +388,217 @@ class PortfolioViewSet(viewsets.ModelViewSet):
         portfolio = self.get_object()
         data = request.data.copy()
         data['portfolio'] = portfolio.id
-        serializer = RebalanceSnapshotSerializer(data=data)
+        serializer = RebalancePlanSerializer(data=data)
         if serializer.is_valid():
             snapshot = serializer.save()
-            return Response(RebalanceSnapshotSerializer(snapshot).data, status=status.HTTP_201_CREATED)
+            return Response(RebalancePlanSerializer(snapshot).data, status=status.HTTP_201_CREATED)
         else:
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['get'])
     def rebalance_snapshots(self, request, pk=None):
         portfolio = self.get_object()
-        snapshots = RebalanceSnapshot.objects.filter(portfolio=portfolio).order_by('-date_created')
-        serializer = RebalanceSnapshotSerializer(snapshots, many=True)
+        snapshots = RebalancePlan.objects.filter(portfolio=portfolio).order_by('-date_created')
+        serializer = RebalancePlanSerializer(snapshots, many=True)
         return Response(serializer.data)
 
     @action(detail=True, methods=['get'])
     def nav_history(self, request, pk=None):
+        """Get NAV history for a portfolio with optional date range filtering"""
         portfolio = self.get_object()
-        nav_snapshots = NAVSnapshot.objects.filter(portfolio=portfolio).order_by('date')
-        serializer = NAVSnapshotSerializer(nav_snapshots, many=True)
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        
+        queryset = PortfolioNAV.objects.filter(portfolio=portfolio)
+        
+        if start_date:
+            try:
+                start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+                queryset = queryset.filter(date__gte=start_date)
+            except ValueError:
+                return Response({'error': 'Invalid start_date format. Use YYYY-MM-DD'}, 
+                              status=status.HTTP_400_BAD_REQUEST)
+        
+        if end_date:
+            try:
+                end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+                queryset = queryset.filter(date__lte=end_date)
+            except ValueError:
+                return Response({'error': 'Invalid end_date format. Use YYYY-MM-DD'}, 
+                              status=status.HTTP_400_BAD_REQUEST)
+        
+        serializer = PortfolioNAVSerializer(queryset.order_by('date'), many=True)
         return Response(serializer.data)
 
     @action(detail=True, methods=['get'])
     def holdings_returns(self, request, pk=None):
+        """Get holdings returns for a portfolio with optional date range and ticker filtering"""
         portfolio = self.get_object()
-        holding_returns = HoldingsReturnSnapshot.objects.filter(portfolio=portfolio).order_by('ticker', 'date')
-        serializer = HoldingsReturnSnapshotSerializer(holding_returns, many=True)
-        return Response(serializer.data)
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        ticker = request.query_params.get('ticker')
+        
+        queryset = HoldingReturn.objects.filter(portfolio=portfolio)
+        
+        if start_date:
+            try:
+                start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+                queryset = queryset.filter(date__gte=start_date)
+            except ValueError:
+                return Response({'error': 'Invalid start_date format. Use YYYY-MM-DD'}, 
+                              status=status.HTTP_400_BAD_REQUEST)
+        
+        if end_date:
+            try:
+                end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+                queryset = queryset.filter(date__lte=end_date)
+            except ValueError:
+                return Response({'error': 'Invalid end_date format. Use YYYY-MM-DD'}, 
+                              status=status.HTTP_400_BAD_REQUEST)
+        
+        if ticker:
+            queryset = queryset.filter(ticker=ticker.upper())
+        
+        # Group by ticker and return as a nested structure
+        returns_by_ticker = {}
+        for snapshot in queryset.order_by('ticker', 'date'):
+            if snapshot.ticker not in returns_by_ticker:
+                returns_by_ticker[snapshot.ticker] = []
+            returns_by_ticker[snapshot.ticker].append({
+                'date': snapshot.date,
+                'daily_return': snapshot.daily_return
+            })
+        
+        return Response(returns_by_ticker)
+
+    @action(detail=True, methods=['get'], url_path='performance_analytics')
+    def performance_analytics(self, request, pk=None):
+        """
+        Return portfolio and benchmark performance analytics for the selected time range and benchmark.
+        """
+        def clean_list(l):
+            return [None if (x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x)))) else x for x in l]
+        portfolio = self.get_object()
+        benchmark = request.query_params.get('benchmark', '^GSPC')
+        range_map = {
+            '1M': 21, '3M': 63, '6M': 126, 'YTD': None, '1Y': 252, '3Y': 756, '5Y': 1260, 'SI': None
+        }
+        range_param = request.query_params.get('range', '5Y')
+        nav_qs = PortfolioNAV.objects.filter(portfolio=portfolio).order_by('date')
+        bench_qs = BenchmarkReturn.objects.filter(benchmark_name=benchmark).order_by('date')
+        if not nav_qs.exists() or not bench_qs.exists():
+            return Response({'error': 'Insufficient data for portfolio or benchmark.'}, status=400)
+        nav_df = pd.DataFrame(list(nav_qs.values('date', 'nav')))
+        bench_df = pd.DataFrame(list(bench_qs.values('date', 'return_index')))
+        # Convert Decimal columns to float for pandas compatibility
+        nav_df['nav'] = nav_df['nav'].astype(float)
+        bench_df['return_index'] = bench_df['return_index'].astype(float)
+        if nav_df.empty or bench_df.empty:
+            return Response({'error': 'Insufficient data for portfolio or benchmark.'}, status=400)
+        nav_df['date'] = pd.to_datetime(nav_df['date'])
+        bench_df['date'] = pd.to_datetime(bench_df['date'])
+        df = pd.merge(nav_df, bench_df, on='date', how='outer').sort_values('date')
+        df['nav'] = df['nav'].ffill()
+        df['return_index'] = df['return_index'].ffill()
+        # Normalize both to 100 at the first available date
+        df['nav_norm'] = df['nav'] / df['nav'].iloc[0] * 100
+        df['bench_norm'] = df['return_index'] / df['return_index'].iloc[0] * 100
+        # Annual returns (calendar years)
+        df['year'] = df['date'].dt.year
+        annual_returns = []
+        for year, group in df.groupby('year'):
+            port_start = group['nav_norm'].iloc[0]
+            port_end = group['nav_norm'].iloc[-1]
+            bench_start = group['bench_norm'].iloc[0]
+            bench_end = group['bench_norm'].iloc[-1]
+            port_ret = (port_end / port_start - 1) * 100 if port_start else None
+            bench_ret = (bench_end / bench_start - 1) * 100 if bench_start else None
+            annual_returns.append({
+                'year': int(year),
+                'portfolio_return': round(port_ret, 2) if port_ret is not None and not math.isnan(port_ret) and not math.isinf(port_ret) else None,
+                'benchmark_return': round(bench_ret, 2) if bench_ret is not None and not math.isnan(bench_ret) and not math.isinf(bench_ret) else None,
+            })
+        # Start and end balances
+        start_balance = df['nav'].iloc[0] if not math.isnan(df['nav'].iloc[0]) and not math.isinf(df['nav'].iloc[0]) else None
+        end_balance = df['nav'].iloc[-1] if not math.isnan(df['nav'].iloc[-1]) and not math.isinf(df['nav'].iloc[-1]) else None
+        # Filter by range
+        if range_param == 'YTD':
+            start = pd.Timestamp(datetime(datetime.now().year, 1, 1))
+            df = df[df['date'] >= start]
+        elif range_param != 'SI' and range_param in range_map:
+            days = range_map[range_param]
+            if days is not None:
+                df = df.iloc[-days:]
+        # Cumulative returns
+        df['portfolio_cum_return'] = df['nav_norm'] / 100 - 1
+        df['benchmark_cum_return'] = df['bench_norm'] / 100 - 1
+        # Rolling 12M returns (trailing)
+        df['portfolio_rolling_12m'] = df['nav_norm'].pct_change(periods=252).fillna(0)
+        df['benchmark_rolling_12m'] = df['bench_norm'].pct_change(periods=252).fillna(0)
+        # Annualized return (CAGR)
+        n_years = (df['date'].iloc[-1] - df['date'].iloc[0]).days / 365.25
+        total_return = df['nav_norm'].iloc[-1] / df['nav_norm'].iloc[0] - 1
+        bench_total_return = df['bench_norm'].iloc[-1] / df['bench_norm'].iloc[0] - 1
+        cagr = (df['nav_norm'].iloc[-1] / df['nav_norm'].iloc[0]) ** (1 / n_years) - 1 if n_years > 0 else 0
+        bench_cagr = (df['bench_norm'].iloc[-1] / df['bench_norm'].iloc[0]) ** (1 / n_years) - 1 if n_years > 0 else 0
+        rel_cagr = cagr - bench_cagr
+        # Standard deviation (annualized)
+        stddev = df['portfolio_cum_return'].pct_change().std() * np.sqrt(252)
+        # Best/worst year
+        df['year'] = df['date'].dt.year
+        yearly = df.groupby('year').agg({'portfolio_cum_return': lambda x: (x.iloc[-1] + 1) / (x.iloc[0] + 1) - 1})
+        best_year = yearly['portfolio_cum_return'].max() if not yearly.empty else None
+        worst_year = yearly['portfolio_cum_return'].min() if not yearly.empty else None
+        # Max drawdown
+        roll_max = df['nav_norm'].cummax()
+        drawdown = df['nav_norm'] / roll_max - 1
+        max_drawdown = drawdown.min()
+        # Sharpe/Sortino (risk-free rate assumed 0)
+        daily_returns = df['portfolio_cum_return'].pct_change().dropna()
+        sharpe = (daily_returns.mean() / daily_returns.std()) * np.sqrt(252) if daily_returns.std() > 0 else None
+        sortino = (daily_returns.mean() / daily_returns[daily_returns < 0].std()) * np.sqrt(252) if (daily_returns < 0).std() > 0 else None
+        # TWR (Time Weighted Return)
+        twr = df['portfolio_cum_return'].iloc[-1]
+        # MWR (Money Weighted Return) - not implemented, placeholder
+        mwr = None
+        # Replace NaN and inf with None for JSON serialization
+        df = df.replace([np.inf, -np.inf], np.nan)
+        df = df.where(pd.notnull(df), None)
+        # Prepare response
+        result = {
+            'dates': [d.strftime('%d/%m/%Y') for d in df['date']],
+            'nav_norm': clean_list(df['nav_norm'].round(6).tolist()),
+            'bench_norm': clean_list(df['bench_norm'].round(6).tolist()),
+            'annual_returns': annual_returns,
+            'portfolio_cum': clean_list(df['portfolio_cum_return'].round(6).tolist()),
+            'benchmark_cum': clean_list(df['benchmark_cum_return'].round(6).tolist()),
+            'portfolio_rolling_12m': clean_list(df['portfolio_rolling_12m'].round(6).tolist()),
+            'benchmark_rolling_12m': clean_list(df['benchmark_rolling_12m'].round(6).tolist()),
+            'metrics': {
+                'start_balance': round(start_balance, 2) if start_balance is not None else None,
+                'end_balance': round(end_balance, 2) if end_balance is not None else None,
+                'total_return': round(total_return * 100, 2) if total_return is not None and not np.isnan(total_return) else None,
+                'annualized_return': round(cagr * 100, 2) if cagr is not None and not np.isnan(cagr) else None,
+                'benchmark_return': round(bench_cagr * 100, 2) if bench_cagr is not None and not np.isnan(bench_cagr) else None,
+                'benchmark_relative': round(rel_cagr * 100, 2) if rel_cagr is not None and not np.isnan(rel_cagr) else None,
+                'stddev': round(stddev * 100, 2) if stddev is not None and not np.isnan(stddev) else None,
+                'best_year': round(best_year * 100, 2) if best_year is not None and not np.isnan(best_year) else None,
+                'worst_year': round(worst_year * 100, 2) if worst_year is not None and not np.isnan(worst_year) else None,
+                'max_drawdown': round(max_drawdown * 100, 2) if max_drawdown is not None and not np.isnan(max_drawdown) else None,
+                'sharpe': round(sharpe, 2) if sharpe is not None and not np.isnan(sharpe) else None,
+                'sortino': round(sortino, 2) if sortino is not None and not np.isnan(sortino) else None,
+                'twr': round(twr * 100, 2) if twr is not None and not np.isnan(twr) else None,
+                'mwr': mwr,
+            },
+        }
+        return Response(result)
+
+    @action(detail=True, methods=['post'])
+    def calculate_and_save_nav(self, request, pk=None):
+        """Calculate and save NAV for the portfolio (for scheduled or manual use)"""
+        portfolio = self.get_object()
+        self.calculate_nav(portfolio)
+        return Response({'status': 'NAV calculated and saved'})
 
 class HoldingViewSet(viewsets.ModelViewSet):
     """
@@ -567,12 +771,12 @@ class HoldingViewSet(viewsets.ModelViewSet):
         }
         return Response(data)
 
-class NAVSnapshotViewSet(viewsets.ModelViewSet):
+class PortfolioNAVViewSet(viewsets.ModelViewSet):
     """
-    ViewSet for NAVSnapshot model operations.
+    ViewSet for PortfolioNAV model operations.
     """
-    queryset = NAVSnapshot.objects.all()
-    serializer_class = NAVSnapshotSerializer
+    queryset = PortfolioNAV.objects.all()
+    serializer_class = PortfolioNAVSerializer
 
 # --- TradeHistoryViewSet ---
 class TradeHistoryViewSet(viewsets.ModelViewSet):
@@ -594,3 +798,17 @@ class TradeHistoryViewSet(viewsets.ModelViewSet):
         if year:
             queryset = queryset.filter(date__year=year)
         return queryset.order_by('-date')
+
+class BenchmarksViewSet(viewsets.ViewSet):
+    """API for listing benchmarks and their returns."""
+    def list(self, request):
+        # List available benchmarks (unique benchmark_name/display_name)
+        qs = BenchmarkReturn.objects.values('benchmark_name', 'display_name').distinct()
+        return Response(list(qs))
+
+    @action(detail=True, methods=['get'], url_path='returns')
+    def returns(self, request, pk=None):
+        # pk is benchmark_name
+        qs = BenchmarkReturn.objects.filter(benchmark_name=pk).order_by('date')
+        serializer = BenchmarkReturnChartSerializer(qs, many=True)
+        return Response(serializer.data)
