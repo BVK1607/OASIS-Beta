@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Portfolio, Holding, PortfolioNAV, HoldingReturn, BenchmarkReturn, RebalancePlan, TradeHistory
+from .models import Portfolio, Holding, PortfolioNAV, HoldingReturn, BenchmarkReturn, RebalancePlan, TradeHistory, FXRate
 
 @admin.register(Portfolio)
 class PortfolioAdmin(admin.ModelAdmin):
@@ -9,11 +9,11 @@ class PortfolioAdmin(admin.ModelAdmin):
 
 @admin.register(Holding)
 class HoldingAdmin(admin.ModelAdmin):
-    list_display = ('id', 'portfolio', 'asset_class', 'isin', 'ticker', 'quantity', 
-                   'book_cost', 'currency', 'trade_date', 'current_price', 'market_value')
-    list_filter = ('asset_class', 'currency', 'portfolio')
-    search_fields = ('isin', 'ticker')
-    ordering = ('-created_at',)
+    list_display = ('portfolio', 'ticker', 'quantity', 'currency', 'purchase_date', 
+                   'purchase_price', 'current_price', 'last_updated')
+    list_filter = ('portfolio', 'currency', 'purchase_date')
+    search_fields = ('ticker', 'portfolio__name')
+    date_hierarchy = 'purchase_date'
 
 @admin.register(PortfolioNAV)
 class PortfolioNAVAdmin(admin.ModelAdmin):
@@ -23,9 +23,14 @@ class PortfolioNAVAdmin(admin.ModelAdmin):
 
 @admin.register(HoldingReturn)
 class HoldingReturnAdmin(admin.ModelAdmin):
-    list_display = ('id', 'portfolio', 'ticker', 'date', 'daily_return')
-    list_filter = ('portfolio', 'ticker', 'date')
-    ordering = ('portfolio', 'ticker', 'date')
+    list_display = ('id', 'portfolio', 'get_ticker', 'date', 'daily_return')
+    list_filter = ('portfolio', 'date')
+    ordering = ('portfolio', 'date')
+    
+    def get_ticker(self, obj):
+        return obj.holding.ticker if obj.holding else None
+    get_ticker.short_description = 'Ticker'
+    get_ticker.admin_order_field = 'holding__ticker'
 
 @admin.register(BenchmarkReturn)
 class BenchmarkReturnAdmin(admin.ModelAdmin):
@@ -45,3 +50,10 @@ class TradeHistoryAdmin(admin.ModelAdmin):
     list_filter = ('portfolio', 'trade_type', 'currency')
     search_fields = ('ticker', 'isin')
     ordering = ('-date',)
+
+@admin.register(FXRate)
+class FXRateAdmin(admin.ModelAdmin):
+    list_display = ('base_currency', 'target_currency', 'rate', 'date', 'last_updated')
+    list_filter = ('base_currency', 'target_currency', 'date')
+    search_fields = ('base_currency', 'target_currency')
+    date_hierarchy = 'date'

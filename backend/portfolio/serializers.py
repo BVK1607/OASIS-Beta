@@ -1,134 +1,68 @@
 from rest_framework import serializers
-from .models import Portfolio, Holding, PortfolioNAV, RebalancePlan, TradeHistory, HoldingReturn, BenchmarkReturn
+from .models import Portfolio, Holding, PortfolioNAV, RebalancePlan, TradeHistory, HoldingReturn, BenchmarkReturn, FXRate
 from decimal import Decimal
 from datetime import datetime
+import re
 
 class HoldingSerializer(serializers.ModelSerializer):
-    trade_date = serializers.DateField(
-        format='%d/%m/%Y',
-        input_formats=['%d/%m/%Y', '%d-%m-%Y', '%Y-%m-%d']
+    purchase_date = serializers.DateField(
+        format='%Y-%m-%d',
+        input_formats=['%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y']
     )
+    quantity = serializers.DecimalField(max_digits=20, decimal_places=6)
+    book_cost = serializers.DecimalField(max_digits=15, decimal_places=2)
+    purchase_price = serializers.DecimalField(max_digits=20, decimal_places=6)
+    current_price = serializers.DecimalField(max_digits=20, decimal_places=6, required=False)
+    market_value = serializers.DecimalField(max_digits=15, decimal_places=2, required=False)
+    
     class Meta:
         model = Holding
         fields = [
-            'id', 'portfolio', 'asset_class', 'isin', 'name', 'ticker',
-            'quantity', 'book_cost', 'currency', 'trade_date',
-            'current_price', 'market_value', 'last_price_update'
+            'id', 'portfolio', 'asset_class', 'isin', 'ticker', 
+            'quantity', 'book_cost', 'currency', 'purchase_date',
+            'purchase_price', 'current_price', 'market_value', 
+            'last_updated', 'created_at', 'updated_at', 'name'
         ]
-        read_only_fields = [
-            'id', 'current_price', 'market_value', 'last_price_update', 'name'
-        ]
+        read_only_fields = ['current_price', 'market_value', 'last_updated', 
+                          'created_at', 'updated_at']
+
+    def validate_currency(self, value):
+        """
+        Check that the currency is a valid 3-letter code.
+        """
+        if not re.match(r'^[A-Z]{3}$', value):
+            raise serializers.ValidationError('Currency must be a valid 3-letter code')
+        return value
+
+class FXRateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = FXRate
+        fields = ['id', 'base_currency', 'target_currency', 'rate', 'date', 'last_updated']
+        read_only_fields = ['last_updated']
 
     def validate(self, data):
         """
-        Validate based on asset class
+        Check that base_currency and target_currency are different.
         """
-        asset_class = data.get('asset_class')
-        
-        if asset_class == 'Cash':
-            # For cash positions, only validate currency and trade_date
-            if not data.get('currency'):
-                raise serializers.ValidationError({'currency': 'Currency is required for cash holdings'})
-            if not data.get('trade_date'):
-                raise serializers.ValidationError({'trade_date': 'Trade date is required for cash holdings'})
-            
-            # For cash, book_cost is the amount of cash
-            if not data.get('book_cost'):
-                raise serializers.ValidationError({'book_cost': 'Amount is required for cash holdings'})
-            
-            # Clear other fields for cash positions
-            data['isin'] = None
-            data['ticker'] = None
-            data['quantity'] = None
-            
-        else:
-            # For non-cash assets, validate all required fields
-            self.validate_isin(data.get('isin'))
-            self.validate_ticker(data.get('ticker'))
-            self.validate_quantity(data.get('quantity'))
-            self.validate_book_cost(data.get('book_cost'))
-            self.validate_currency(data.get('currency'))
-            
+        if data['base_currency'] == data['target_currency']:
+            raise serializers.ValidationError('Base currency and target currency must be different')
         return data
 
-    def validate_isin(self, value):
-        """Validate ISIN format"""
-        if value is None:
-            return value
-        if not value:
-            raise serializers.ValidationError("ISIN is required for non-cash holdings")
-        if len(value) != 12:
-            raise serializers.ValidationError("ISIN must be exactly 12 characters long")
-        return value.upper()
-
-    def validate_ticker(self, value):
-        """Validate ticker format"""
-        if value is None:
-            return value
-        if not value:
-            raise serializers.ValidationError("Ticker is required for non-cash holdings")
-        if len(value) > 10:
-            raise serializers.ValidationError("Ticker must be 10 characters or less")
-        return value.upper()
-
-    def validate_quantity(self, value):
-        """Validate quantity is positive"""
-        if value is None:
-            return value
-        try:
-            quantity = Decimal(str(value))
-            if quantity <= 0:
-                raise serializers.ValidationError("Quantity must be greater than 0")
-            return quantity
-        except (TypeError, ValueError):
-            raise serializers.ValidationError("Quantity must be a valid number")
-
-    def validate_book_cost(self, value):
-        """Validate book cost is positive"""
-        if value is None:
-            return value
-        try:
-            book_cost = Decimal(str(value))
-            if book_cost <= 0:
-                raise serializers.ValidationError("Amount/Book cost must be greater than 0")
-            return book_cost
-        except (TypeError, ValueError):
-            raise serializers.ValidationError("Amount/Book cost must be a valid number")
-
-    def validate_currency(self, value):
-        """Validate currency format"""
-        if not value:
-            raise serializers.ValidationError("Currency is required")
-        if len(value) != 3:
-            raise serializers.ValidationError("Currency must be a 3-letter code")
-        return value.upper()
-
-    def validate_asset_class(self, value):
-        """Validate asset class"""
-        if not value:
-            raise serializers.ValidationError("Asset class is required")
-        valid_classes = ['Equity', 'Fixed Income', 'Alternatives', 'Cash']
-        if value not in valid_classes:
-            raise serializers.ValidationError(f"Asset class must be one of: {', '.join(valid_classes)}")
+    def validate_base_currency(self, value):
+        """
+        Check that the base currency is a valid 3-letter code.
+        """
+        if not re.match(r'^[A-Z]{3}$', value):
+            raise serializers.ValidationError('Base currency must be a valid 3-letter code')
         return value
 
-    def validate_trade_date(self, value):
-        """Validate trade date"""
-        if not value:
-            raise serializers.ValidationError("Trade date is required")
+    def validate_target_currency(self, value):
+        """
+        Check that the target currency is a valid 3-letter code.
+        """
+        if not re.match(r'^[A-Z]{3}$', value):
+            raise serializers.ValidationError('Target currency must be a valid 3-letter code')
         return value
-
-    def to_internal_value(self, data):
-        # Accept DD-MM-YYYY, DD/MM/YYYY, or YYYY-MM-DD for trade_date
-        trade_date = data.get('trade_date')
-        if isinstance(trade_date, str):
-            for fmt in ('%d-%m-%Y', '%d/%m/%Y', '%Y-%m-%d'):
-                try:
-                    data['trade_date'] = datetime.strptime(trade_date, fmt).date()
-                    break
-                except ValueError:
-                    continue
-        return super().to_internal_value(data)
 
 class PortfolioNAVSerializer(serializers.ModelSerializer):
     class Meta:
@@ -167,12 +101,14 @@ class PortfolioSerializer(serializers.ModelSerializer):
     target_return = serializers.DecimalField(
         max_digits=5, decimal_places=2, required=False, allow_null=True
     )
+    base_currency = serializers.ChoiceField(choices=Portfolio.CURRENCY_CHOICES, default='USD')
 
     class Meta:
         model = Portfolio
         fields = [
             'id', 'name', 'description', 'risk_tolerance', 'target_return', 'creation_date',
-            'holdings', 'nav_snapshots', 'total_market_value', 'total_book_cost', 'total_gain_loss'
+            'holdings', 'nav_snapshots', 'total_market_value', 'total_book_cost', 'total_gain_loss',
+            'base_currency'
         ]
         read_only_fields = ['id']
 

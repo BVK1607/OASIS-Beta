@@ -1,0 +1,9 @@
+# Run every 15 minutes between 8:00 and 23:00 UK time
+*/15 8-22 * * * cd /path/to/backend && python manage.py update_daily_nav >> /var/log/portfolio/update_nav.log 2>&1
+
+# Run every 30 minutes between 8:00 and 23:00 UK time
+*/30 8-22 * * * cd /path/to/backend && python manage.py update_benchmark_data >> /var/log/portfolio/update_benchmark.log 2>&1
+
+# Run once at 23:00 UK time for final updates
+0 23 * * * cd /path/to/backend && python manage.py update_daily_nav >> /var/log/portfolio/update_nav_final.log 2>&1
+0 23 * * * cd /path/to/backend && python manage.py update_benchmark_data >> /var/log/portfolio/update_benchmark_final.log 2>&1 

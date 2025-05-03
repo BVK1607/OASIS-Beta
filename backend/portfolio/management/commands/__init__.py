@@ -1,1 +1,3 @@
- 
+"""
+Django management commands
+""" 
