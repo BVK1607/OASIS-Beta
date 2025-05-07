@@ -56,29 +56,15 @@ class Command(BaseCommand):
                 )
             
             # 4. Check trade history consistency
-            trades = TradeHistory.objects.filter(portfolio=portfolio)
-            for trade in trades:
-                if trade.trade_type in ['Buy', 'Sell']:
-                    holding = portfolio.holdings.filter(
-                        ticker=trade.ticker,
-                        trade_date__lte=trade.date
-                    ).order_by('-trade_date').first()
-                    
-                    if holding:
-                        expected_quantity = holding.quantity
-                        if trade.trade_type == 'Buy':
-                            expected_quantity += trade.quantity
-                        else:
-                            expected_quantity -= trade.quantity
-                        
-                        if expected_quantity < 0:
-                            logger.error(
-                                f"Portfolio {portfolio.id}: Trade {trade.id} would result in negative quantity"
-                            )
+            changes = self.check_trade_history(portfolio, datetime.now().date())
+            if changes:
+                logger.error(f"Portfolio {portfolio.id}: Trade history inconsistencies:")
+                for change in changes:
+                    logger.error(change)
             
             # 5. Check for duplicate holdings
             duplicate_holdings = portfolio.holdings.values(
-                'isin', 'trade_date'
+                'isin', 'purchase_date'
             ).annotate(
                 count=models.Count('id')
             ).filter(count__gt=1)
@@ -90,3 +76,41 @@ class Command(BaseCommand):
                 )
         
         self.stdout.write(self.style.SUCCESS('Data consistency check completed')) 
+
+    def check_trade_history(self, portfolio, date):
+        """Check trade history for a portfolio on a given date"""
+        changes = []
+        
+        # Get all trades for this date
+        trades = TradeHistory.objects.filter(
+            portfolio=portfolio,
+            date=date
+        )
+        
+        for trade in trades:
+            # Get the holding as it was at the time of the trade
+            holding = Holding.objects.filter(
+                portfolio=portfolio,
+                purchase_date__lte=trade.date
+            ).order_by('-purchase_date').first()
+            
+            if not holding:
+                changes.append(f"No holding found for trade {trade.id}")
+                continue
+            
+            # Check trade details match holding
+            fields_to_check = [
+                'portfolio', 'asset', 'quantity', 'book_cost',
+                'isin', 'purchase_date'
+            ]
+            
+            for field in fields_to_check:
+                trade_value = getattr(trade, field)
+                holding_value = getattr(holding, field)
+                if trade_value != holding_value:
+                    changes.append(
+                        f"Trade {trade.id} {field} mismatch: "
+                        f"trade={trade_value}, holding={holding_value}"
+                    )
+        
+        return changes 

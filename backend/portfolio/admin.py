@@ -1,25 +1,38 @@
 from django.contrib import admin
-from .models import Portfolio, Holding, PortfolioNAV, HoldingReturn, BenchmarkReturn, RebalancePlan, TradeHistory, FXRate
+from .models import Portfolio, Holding, Asset, GlobalMarketPrice, PortfolioNAV, HoldingReturn, BenchmarkReturn, RebalancePlan, TradeHistory, FXRate
 
 @admin.register(Portfolio)
 class PortfolioAdmin(admin.ModelAdmin):
-    list_display = ('id', 'name', 'description', 'created_at', 'updated_at')
-    search_fields = ('name', 'description')
-    ordering = ('-created_at',)
+    list_display = ['name', 'risk_tolerance', 'base_currency', 'creation_date', 'total_value']
+    list_filter = ['risk_tolerance', 'base_currency']
+    search_fields = ['name', 'description']
+    ordering = ['creation_date']
 
 @admin.register(Holding)
 class HoldingAdmin(admin.ModelAdmin):
-    list_display = ('portfolio', 'ticker', 'quantity', 'currency', 'purchase_date', 
-                   'purchase_price', 'current_price', 'last_updated')
-    list_filter = ('portfolio', 'currency', 'purchase_date')
-    search_fields = ('ticker', 'portfolio__name')
-    date_hierarchy = 'purchase_date'
+    list_display = ['portfolio', 'asset', 'quantity', 'book_cost', 'market_value', 'asset_class']
+    list_filter = ['asset_class', 'portfolio']
+    search_fields = ['ticker', 'isin']
+
+@admin.register(Asset)
+class AssetAdmin(admin.ModelAdmin):
+    list_display = ['ticker', 'name', 'asset_class', 'currency', 'market']
+    list_filter = ['asset_class', 'currency', 'market']
+    search_fields = ['ticker', 'name', 'isin']
+
+@admin.register(GlobalMarketPrice)
+class GlobalMarketPriceAdmin(admin.ModelAdmin):
+    list_display = ['asset', 'date', 'price', 'is_trading_day', 'last_updated']
+    list_filter = ['is_trading_day', 'date']
+    search_fields = ['asset__ticker']
+    ordering = ['-date']
 
 @admin.register(PortfolioNAV)
 class PortfolioNAVAdmin(admin.ModelAdmin):
-    list_display = ('id', 'portfolio', 'date', 'nav')
-    list_filter = ('portfolio', 'date')
-    ordering = ('-date',)
+    list_display = ['portfolio', 'date', 'total_value', 'nav', 'daily_return', 'last_updated']
+    list_filter = ['portfolio', 'date']
+    search_fields = ['portfolio__name']
+    ordering = ['-date']
 
 @admin.register(HoldingReturn)
 class HoldingReturnAdmin(admin.ModelAdmin):

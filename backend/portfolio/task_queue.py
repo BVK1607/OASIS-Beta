@@ -14,22 +14,79 @@ logger = logging.getLogger(__name__)
 
 class TaskQueue:
     def __init__(self):
-        # Separate queues for live and historical updates
-        self.live_queue = Queue()
-        self.historical_queue = PriorityQueue()
-        self.is_running = True
+        self._queue = []
+        self._running = False
+        self._lock = threading.Lock()
         
-        # Separate worker threads
-        self.live_worker = threading.Thread(target=self._process_live_queue, daemon=True)
-        self.historical_worker = threading.Thread(target=self._process_historical_queue, daemon=True)
+    def add_historical_data_task(self, portfolio_id: int, start_date=None, end_date=None):
+        """Add a task to update historical market data"""
+        with self._lock:
+            self._queue.append({
+                'type': 'historical_data',
+                'portfolio_id': portfolio_id,
+                'start_date': start_date,
+                'end_date': end_date
+            })
+            if not self._running:
+                self._start_processing()
+                
+    def _process_historical_data_task(self, task):
+        """Process a historical data update task"""
+        from .models import Holding, Asset
+        from .market_data import fetch_and_store_historical_prices
         
-        # Start workers
-        self.live_worker.start()
-        self.historical_worker.start()
+        portfolio_id = task['portfolio_id']
+        start_date = task['start_date']
+        end_date = task['end_date']
+        
+        # Get all unique tickers in the portfolio
+        holdings = Holding.objects.filter(portfolio_id=portfolio_id)
+        tickers = set(holdings.exclude(ticker='').values_list('ticker', flat=True))
+        
+        for ticker in tickers:
+            try:
+                # Get asset
+                asset = Asset.objects.get(ticker=ticker)
+                
+                # Fetch historical prices
+                success = fetch_and_store_historical_prices(ticker, start_date, end_date)
+                if not success:
+                    logger.error(f"Failed to fetch historical prices for {ticker}")
+                    
+            except Exception as e:
+                logger.error(f"Error processing historical data for {ticker}: {e}")
+                continue
+                
+    def _process_task(self, task):
+        """Process a single task"""
+        try:
+            if task['type'] == 'historical_data':
+                self._process_historical_data_task(task)
+            elif task['type'] == 'live_prices':
+                self._process_live_prices_task(task)
+        except Exception as e:
+            logger.error(f"Error processing task: {e}")
+            
+    def _start_processing(self):
+        """Start processing tasks in the background"""
+        def process_loop():
+            self._running = True
+            while True:
+                with self._lock:
+                    if not self._queue:
+                        self._running = False
+                        break
+                    task = self._queue.pop(0)
+                    
+                self._process_task(task)
+                
+        thread = threading.Thread(target=process_loop)
+        thread.daemon = True
+        thread.start()
 
     def _process_live_queue(self):
         """Process live price updates with high priority"""
-        while self.is_running:
+        while self._running:
             try:
                 portfolio_id = self.live_queue.get()
                 if portfolio_id is None:  # Poison pill
@@ -46,7 +103,7 @@ class TaskQueue:
 
     def _process_historical_queue(self):
         """Process historical data updates with lower priority"""
-        while self.is_running:
+        while self._running:
             try:
                 priority, (portfolio_id, start_date) = self.historical_queue.get()
                 if portfolio_id is None:  # Poison pill
@@ -209,8 +266,8 @@ class TaskQueue:
                         market_data = get_market_price(holding.ticker)
                         
                         if market_data['is_clean']:
-                            holding.current_price = market_data['price']
-                            holding.market_value = market_data['price'] * holding.quantity
+                            holding.current_price = market_data
+                            holding.market_value = market_data * holding.quantity
                             holding.last_price_update = market_data['timestamp']
                             holding.save()
 
@@ -273,24 +330,6 @@ class TaskQueue:
         finally:
             # Always clear the lock when done
             cache.delete(f'price_update_lock_{portfolio_id}')
-
-    def add_historical_data_task(self, portfolio_id: int, start_date):
-        """Queue historical data processing task with lower priority"""
-        # Use current time as priority (lower number = higher priority)
-        priority = int(time.time())
-        self.historical_queue.put((priority, (portfolio_id, start_date)))
-
-    def add_live_prices_task(self, portfolio_id: int):
-        """Queue live price update task with high priority"""
-        self.live_queue.put(portfolio_id)
-
-    def shutdown(self):
-        """Shutdown the task queue gracefully"""
-        self.is_running = False
-        self.live_queue.put(None)  # Add poison pill to live queue
-        self.historical_queue.put((0, (None, None)))  # Add poison pill to historical queue
-        self.live_worker.join()
-        self.historical_worker.join()
 
 # Create global task queue instance
 task_queue = TaskQueue() 

@@ -5,6 +5,7 @@ from datetime import datetime
 import re
 
 class HoldingSerializer(serializers.ModelSerializer):
+    name = serializers.CharField(source='asset.name', read_only=True)
     purchase_date = serializers.DateField(
         format='%Y-%m-%d',
         input_formats=['%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y']
@@ -19,12 +20,12 @@ class HoldingSerializer(serializers.ModelSerializer):
         model = Holding
         fields = [
             'id', 'portfolio', 'asset_class', 'isin', 'ticker', 
+            'name',
             'quantity', 'book_cost', 'currency', 'purchase_date',
             'purchase_price', 'current_price', 'market_value', 
-            'last_updated', 'created_at', 'updated_at', 'name'
+            'last_updated'
         ]
-        read_only_fields = ['current_price', 'market_value', 'last_updated', 
-                          'created_at', 'updated_at']
+        read_only_fields = ['current_price', 'market_value', 'last_updated', 'name']
 
     def validate_currency(self, value):
         """
@@ -33,6 +34,42 @@ class HoldingSerializer(serializers.ModelSerializer):
         if not re.match(r'^[A-Z]{3}$', value):
             raise serializers.ValidationError('Currency must be a valid 3-letter code')
         return value
+
+    def validate_quantity(self, value):
+        """
+        Check that quantity is positive.
+        """
+        if value <= 0:
+            raise serializers.ValidationError('Quantity must be positive')
+        return value
+
+    def validate_book_cost(self, value):
+        """
+        Check that book cost is positive.
+        """
+        if value <= 0:
+            raise serializers.ValidationError('Book cost must be positive')
+        return value
+
+    def validate_purchase_price(self, value):
+        """
+        Check that purchase price is positive.
+        """
+        if value <= 0:
+            raise serializers.ValidationError('Purchase price must be positive')
+        return value
+
+    def validate(self, data):
+        """
+        Validate the relationship between quantity, book cost, and purchase price.
+        """
+        if data.get('quantity') and data.get('book_cost') and data.get('purchase_price'):
+            expected_book_cost = data['quantity'] * data['purchase_price']
+            if abs(expected_book_cost - data['book_cost']) > Decimal('0.01'):
+                raise serializers.ValidationError(
+                    'Book cost should equal quantity multiplied by purchase price'
+                )
+        return data
 
 class FXRateSerializer(serializers.ModelSerializer):
     class Meta:
@@ -88,7 +125,7 @@ class PortfolioSerializer(serializers.ModelSerializer):
         input_formats=['%d/%m/%Y', '%d-%m-%Y', '%Y-%m-%d']
     )
     holdings = HoldingSerializer(many=True, read_only=True)
-    nav_snapshots = PortfolioNAVSerializer(many=True, read_only=True)
+    nav_records = PortfolioNAVSerializer(many=True, read_only=True)
     total_market_value = serializers.DecimalField(
         max_digits=15, decimal_places=2, read_only=True
     )
@@ -107,7 +144,7 @@ class PortfolioSerializer(serializers.ModelSerializer):
         model = Portfolio
         fields = [
             'id', 'name', 'description', 'risk_tolerance', 'target_return', 'creation_date',
-            'holdings', 'nav_snapshots', 'total_market_value', 'total_book_cost', 'total_gain_loss',
+            'holdings', 'nav_records', 'total_market_value', 'total_book_cost', 'total_gain_loss',
             'base_currency'
         ]
         read_only_fields = ['id']

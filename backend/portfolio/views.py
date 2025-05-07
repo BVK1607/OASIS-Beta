@@ -3,10 +3,10 @@ from rest_framework import viewsets, status
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from django.shortcuts import get_object_or_404
-from .models import Portfolio, Holding, PortfolioNAV, RebalancePlan, TradeHistory, HoldingReturn, BenchmarkReturn
+from .models import Portfolio, Holding, PortfolioNAV, RebalancePlan, TradeHistory, HoldingReturn, BenchmarkReturn, Asset
 from .serializers import PortfolioSerializer, HoldingSerializer, PortfolioNAVSerializer, RebalancePlanSerializer, TradeHistorySerializer, HoldingReturnSerializer, BenchmarkListSerializer, BenchmarkReturnChartSerializer
-from .market_data import get_market_price, get_or_fetch_fx_rate, PriceValidationError
-from datetime import datetime, timedelta
+from .market_data import get_market_price, get_or_fetch_fx_rate, PriceValidationError, update_market_prices, get_or_fetch_market_price, fetch_and_store_historical_prices
+from datetime import datetime, timedelta, date
 from django.db import transaction
 import io
 import logging
@@ -31,6 +31,8 @@ from django.db.models import Prefetch, F, Sum
 import yfinance as yf
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
+from .services import PortfolioNAVService
+from rest_framework.views import APIView
 
 logger = logging.getLogger(__name__)
 
@@ -51,13 +53,12 @@ class PortfolioViewSet(viewsets.ModelViewSet):
     """
     queryset = Portfolio.objects.prefetch_related(
         'holdings',
-        'navs'
+        'nav_records'
     ).all()
     serializer_class = PortfolioSerializer
     pagination_class = None  # Disable pagination for portfolio list
     permission_classes = [AllowAny]  # Allow all access
 
-    @method_decorator(cache_page(60 * 15))  # Cache for 15 minutes
     def list(self, request, *args, **kwargs):
         try:
             queryset = self.get_queryset()
@@ -85,14 +86,12 @@ class PortfolioViewSet(viewsets.ModelViewSet):
             )
 
     def create(self, request, *args, **kwargs):
-        """Override create to handle historical data processing in queue"""
+        """Override create to handle historical data processing in queue and NAV backfill"""
         try:
             with transaction.atomic():
-                # Create the portfolio first
                 response = super().create(request, *args, **kwargs)
                 portfolio = Portfolio.objects.get(id=response.data['id'])
-                
-                # If there are initial holdings, process them normally first
+                # If there are initial holdings, process them
                 if 'holdings' in request.data:
                     holdings = []
                     for holding_data in request.data['holdings']:
@@ -100,14 +99,24 @@ class PortfolioViewSet(viewsets.ModelViewSet):
                         serializer = HoldingSerializer(data=holding_data)
                         if serializer.is_valid():
                             holdings.append(serializer.save())
-                    
-                    # Queue the historical data processing
                     if holdings:
                         task_queue.add_historical_data_task(portfolio.id, holdings)
                         response.data['message'] = 'Portfolio created. Historical data processing queued.'
-                
+                # Fetch historical prices for all tickers in the portfolio
+                holdings = portfolio.holdings.all()
+                if holdings:
+                    today = timezone.now().date()
+                    ticker_dates = {}
+                    for holding in holdings:
+                        if holding.ticker not in ticker_dates:
+                            ticker_dates[holding.ticker] = holding.purchase_date
+                        else:
+                            ticker_dates[holding.ticker] = min(ticker_dates[holding.ticker], holding.purchase_date)
+                    for ticker, start_date in ticker_dates.items():
+                        fetch_and_store_historical_prices(ticker, start_date, today)
+                    # Backfill NAV and holding returns
+                    PortfolioNAVService.backfill_portfolio_time_series(portfolio)
                 return response
-                
         except Exception as e:
             logger.error(f"Error creating portfolio: {str(e)}")
             return Response(
@@ -143,16 +152,13 @@ class PortfolioViewSet(viewsets.ModelViewSet):
                 holding = serializer.save()
                 
                 # Fetch current market price
-                try:
-                    price_data = get_market_price(holding.ticker)
-                    if price_data and price_data.get('price'):
-                        holding.current_price = price_data['price']
-                        holding.market_value = price_data['price'] * holding.quantity
-                        holding.last_updated = timezone.now()
-                        holding.save()
-                        logger.info(f"Updated market price: {price_data['price']}")
-                except Exception as e:
-                    logger.error(f"Error fetching market price: {str(e)}")
+                price = get_market_price(holding.ticker)
+                if price is not None:
+                    holding.current_price = price
+                    holding.market_value = price * holding.quantity
+                    holding.last_updated = timezone.now()
+                    holding.save()
+                    logger.info(f"Updated market price: {price}")
                 
                 return Response(
                     HoldingSerializer(holding).data,
@@ -168,6 +174,13 @@ class PortfolioViewSet(viewsets.ModelViewSet):
                 {'error': str(e)},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+    def get_currency_for_ticker(self, ticker):
+        try:
+            info = yf.Ticker(ticker).info
+            return info.get('currency', 'USD')
+        except Exception:
+            return 'USD'
 
     @action(detail=True, methods=['post'])
     def upload_csv(self, request, pk=None):
@@ -189,13 +202,13 @@ class PortfolioViewSet(viewsets.ModelViewSet):
             df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
             
             # Validate required columns based on format
-            modern_format = all(col in df.columns for col in ['asset_class', 'isin', 'ticker', 'quantity', 'book_cost', 'currency', 'purchase_date'])
+            modern_format = all(col in df.columns for col in ['asset_class', 'isin', 'ticker', 'quantity', 'book_cost', 'purchase_date'])
             legacy_format = all(col in df.columns for col in ['isin', 'ticker', 'quantity', 'book_cost', 'purchase_date'])
             
             if not (modern_format or legacy_format):
                 return Response({
                     'error': 'Invalid CSV format. Required columns missing.',
-                    'modern_format': 'asset_class,isin,ticker,quantity,book_cost,currency,purchase_date',
+                    'modern_format': 'asset_class,isin,ticker,quantity,book_cost,purchase_date',
                     'legacy_format': 'isin,ticker,quantity,book_cost,purchase_date'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
@@ -226,6 +239,11 @@ class PortfolioViewSet(viewsets.ModelViewSet):
                         errors.append(f"Row {index + 1}: Invalid date format for purchase_date")
                         continue
                     
+                    # Auto-detect currency if not provided
+                    currency = row.get('currency')
+                    if not currency or currency == '':
+                        currency = self.get_currency_for_ticker(row['ticker'])
+                    
                     # Create holding data
                     holding_data = {
                         'portfolio': portfolio,
@@ -236,7 +254,7 @@ class PortfolioViewSet(viewsets.ModelViewSet):
                         'purchase_date': purchase_date,
                         'purchase_price': book_cost / quantity if quantity > 0 else 0,
                         'asset_class': row.get('asset_class', 'Equity'),  # Default to Equity for legacy format
-                        'currency': row.get('currency', 'USD'),  # Default to USD for legacy format
+                        'currency': currency,
                     }
                     
                     holdings_to_create.append(holding_data)
@@ -268,7 +286,6 @@ class PortfolioViewSet(viewsets.ModelViewSet):
                                 }
                             )
                     break  # Success, exit retry loop
-                    
                 except OperationalError as e:
                     if "database is locked" in str(e).lower():
                         retries += 1
@@ -280,9 +297,22 @@ class PortfolioViewSet(viewsets.ModelViewSet):
                             raise
                     else:
                         raise
-                        
+            # Fetch historical prices for all tickers in the portfolio
+            holdings = portfolio.holdings.all()
+            if holdings:
+                today = timezone.now().date()
+                ticker_dates = {}
+                for holding in holdings:
+                    if holding.ticker not in ticker_dates:
+                        ticker_dates[holding.ticker] = holding.purchase_date
+                    else:
+                        ticker_dates[holding.ticker] = min(ticker_dates[holding.ticker], holding.purchase_date)
+                for ticker, start_date in ticker_dates.items():
+                    fetch_and_store_historical_prices(ticker, start_date, today)
+                # Backfill NAV and holding returns
+                PortfolioNAVService.backfill_portfolio_time_series(portfolio)
             return Response({
-                'message': f'Successfully uploaded {len(holdings_to_create)} holdings',
+                'message': f'Successfully uploaded {len(holdings_to_create)} holdings, fetched historical prices, and updated NAV/returns',
                 'holdings_created': len(holdings_to_create)
             })
             
@@ -465,7 +495,7 @@ class PortfolioViewSet(viewsets.ModelViewSet):
                             continue
                             
                         market_data = get_market_price(holding.ticker)
-                        if market_data and market_data.get('price') is not None:
+                        if market_data is not None:
                             price = Decimal(str(market_data['price']))
                             total_value += price * holding.quantity
                         else:
@@ -736,11 +766,44 @@ class PortfolioViewSet(viewsets.ModelViewSet):
                 'date': bench.date,
                 'value': bench_value
             })
-        
-        return Response({
+
+        # Patch: Add metrics for frontend
+        start_balance = float(portfolio.total_book_cost) if portfolio.total_book_cost is not None else 0.0
+        end_balance = float(nav_data.last().total_value) if nav_data.exists() else 0.0
+        metrics = {
+            'start_balance': start_balance,
+            'end_balance': end_balance,
+            'annualized_return': None,
+            'stddev': None,
+            'best_year': None,
+            'worst_year': None,
+            'max_drawdown': None,
+            'sharpe': None,
+            'sortino': None,
+        }
+
+        # Defensive: Always include all keys expected by frontend
+        # Rebase nav_norm and bench_norm to 100
+        nav_norm = [float(nav.nav) for nav in nav_data] if nav_data.exists() else []
+        bench_norm = [float(b['value']) for b in benchmark_returns] if benchmark_returns else []
+        if nav_norm:
+            base = nav_norm[0] if nav_norm[0] != 0 else 1.0
+            nav_norm = [(v / base) * 100 for v in nav_norm]
+        if bench_norm:
+            base = bench_norm[0] if bench_norm[0] != 0 else 1.0
+            bench_norm = [(v / base) * 100 for v in bench_norm]
+        response = {
+            'metrics': metrics,
+            'dates': [str(nav.date) for nav in nav_data] if nav_data.exists() else [],
+            'nav_norm': nav_norm,
+            'bench_norm': bench_norm,
+            'annual_returns': [],
+            'portfolio_rolling_12m': [],
+            'benchmark_rolling_12m': [],
             'portfolio_returns': portfolio_returns,
             'benchmark_returns': benchmark_returns
-        })
+        }
+        return Response(response)
 
     @action(detail=True, methods=['post'])
     def calculate_and_save_nav(self, request, pk=None):
@@ -788,6 +851,79 @@ class PortfolioViewSet(viewsets.ModelViewSet):
                 'message': str(e)
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @action(detail=True, methods=['get'])
+    def holdings(self, request, pk=None):
+        portfolio = self.get_object()
+        holdings = Holding.objects.filter(portfolio=portfolio)
+        serializer = HoldingSerializer(holdings, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['get'])
+    def nav(self, request, pk=None):
+        portfolio = self.get_object()
+        date_str = request.query_params.get('date', timezone.now().date().isoformat())
+        try:
+            target_date = date.fromisoformat(date_str)
+        except ValueError:
+            return Response(
+                {'error': 'Invalid date format. Use YYYY-MM-DD'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        holdings = Holding.objects.filter(portfolio=portfolio)
+        market_values = update_market_prices(holdings, target_date)
+        
+        total_nav = sum(market_values.values())
+        return Response({
+            'date': target_date.isoformat(),
+            'nav': str(total_nav),
+            'holdings': market_values
+        })
+
+    @action(detail=True, methods=['get'])
+    def risk_analytics(self, request, pk=None):
+        import pandas as pd
+        import numpy as np
+        portfolio = self.get_object()
+        benchmark_name = request.query_params.get('benchmark', '^GSPC')
+
+        # Fetch NAV daily returns
+        nav_qs = PortfolioNAV.objects.filter(portfolio=portfolio).order_by('date')
+        nav_df = pd.DataFrame(list(nav_qs.values('date', 'daily_return')))
+        nav_df = nav_df.dropna(subset=['daily_return'])
+        if len(nav_df) < 2:
+            return Response({"error": "Not enough NAV data to calculate risk metrics"}, status=400)
+
+        # Fetch benchmark returns for same dates
+        bench_qs = BenchmarkReturn.objects.filter(
+            benchmark_name=benchmark_name,
+            date__in=nav_df['date']
+        ).order_by('date')
+        bench_df = pd.DataFrame(list(bench_qs.values('date', 'daily_return')))
+
+        # Align by date
+        merged = pd.merge(nav_df, bench_df, on='date', how='inner', suffixes=('_portfolio', '_benchmark'))
+        if len(merged) < 2:
+            return Response({"error": "Not enough aligned data to calculate risk metrics"}, status=400)
+
+        returns = merged['daily_return_portfolio'].astype(float)
+        bench_returns = merged['daily_return_benchmark'].astype(float)
+
+        # Metrics
+        total_risk = np.std(returns) * np.sqrt(252)
+        tracking_error = np.std(returns - bench_returns) * np.sqrt(252)
+        value_at_risk = -np.percentile(returns, 5)
+        ex_ante_vol = returns.rolling(window=21).std().iloc[-1] * np.sqrt(252)
+
+        # Round
+        result = {
+            "total_risk": round(float(total_risk), 4),
+            "tracking_error": round(float(tracking_error), 4),
+            "value_at_risk": round(float(value_at_risk), 4),
+            "ex_ante_volatility": round(float(ex_ante_vol), 4) if not np.isnan(ex_ante_vol) else None,
+        }
+        return Response(result)
+
 class HoldingViewSet(viewsets.ModelViewSet):
     """
     ViewSet for Holding model operations.
@@ -799,105 +935,119 @@ class HoldingViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """Filter holdings by portfolio if specified"""
         portfolio_id = self.request.query_params.get('portfolio')
+        qs = Holding.objects.all()
         if portfolio_id:
-            return Holding.objects.filter(portfolio_id=portfolio_id)
-        return Holding.objects.all()
-
-    def create(self, request, *args, **kwargs):
-        """Create a new holding without market price update"""
-        try:
-            serializer = self.get_serializer(data=request.data)
-            serializer.is_valid(raise_exception=True)
-            
-            # Create the holding first
-            holding = serializer.save()
-            
-            # For cash positions, set market value equal to book cost
-            if holding.asset_class == 'Cash':
-                holding.current_price = holding.book_cost
-                holding.market_value = holding.book_cost
-                holding.last_price_update = timezone.now()
-                holding.save()
-            
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-            
-        except Exception as e:
-            logger.error(f"Error creating holding: {str(e)}")
-            return Response(
-                {'error': f'Failed to create holding: {str(e)}'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            qs = qs.filter(portfolio_id=portfolio_id)
+        return qs.order_by('id')
 
     def perform_create(self, serializer):
-        """Override to handle cash positions"""
-        holding = serializer.save()
-        
-        # For cash positions, set market value equal to book cost
-        if holding.asset_class == 'Cash':
-            holding.current_price = holding.book_cost
-            holding.market_value = holding.book_cost
-            holding.last_price_update = timezone.now()
-            holding.save()
+        with transaction.atomic():
+            # Get or create asset
+            ticker = serializer.validated_data.get('ticker')
+            if ticker:
+                # Try to fetch real name from yfinance
+                try:
+                    info = yf.Ticker(ticker).info
+                    asset_name = info.get('shortName') or info.get('longName') or ticker
+                except Exception:
+                    asset_name = ticker
+                asset, created = Asset.objects.get_or_create(
+                    ticker=ticker,
+                    defaults={
+                        'name': asset_name,
+                        'asset_class': 'Equity',
+                        'currency': 'USD',
+                        'market': 'US'
+                    }
+                )
+                # If asset already exists but name is default, update it
+                if not created and asset.name == asset.ticker and asset_name != ticker:
+                    asset.name = asset_name
+                    asset.save(update_fields=['name'])
+                serializer.validated_data['asset'] = asset
+            # Save the holding
+            holding = serializer.save()
+            # Update market price if not cash
+            price = get_or_fetch_market_price(
+                holding.asset.ticker,
+                timezone.now().date()
+            )
+            if price is not None:
+                holding.current_price = price
+                holding.market_value = price * holding.quantity
+                holding.save()
 
     def perform_update(self, serializer):
-        """Override to handle cash positions"""
-        holding = serializer.save()
-        
-        # For cash positions, set market value equal to book cost
-        if holding.asset_class == 'Cash':
-            holding.current_price = holding.book_cost
-            holding.market_value = holding.book_cost
-            holding.last_price_update = timezone.now()
-            holding.save()
-
-    @action(detail=True, methods=['post'])
-    def update_price(self, request, pk=None):
-        """Update market price for a specific holding"""
-        holding = self.get_object()
-        
-        if holding.asset_class == 'Cash':
-            return Response(
-                HoldingSerializer(holding).data,
-                status=status.HTTP_200_OK
-            )
-        
-        try:
-            # Get stock info directly
-            stock = yf.Ticker(holding.ticker)
-            current_price = stock.info.get('regularMarketPrice')
-            
-            if current_price:
-                holding.current_price = Decimal(str(current_price))
-                holding.market_value = (holding.current_price * holding.quantity)
-                holding.last_price_update = timezone.now()
-                holding.save()
-                
-                return Response(
-                    HoldingSerializer(holding).data,
-                    status=status.HTTP_200_OK
+        with transaction.atomic():
+            # Get or create asset if ticker is provided
+            ticker = serializer.validated_data.get('ticker')
+            if ticker:
+                # Try to fetch real name from yfinance
+                try:
+                    info = yf.Ticker(ticker).info
+                    asset_name = info.get('shortName') or info.get('longName') or ticker
+                except Exception:
+                    asset_name = ticker
+                asset, created = Asset.objects.get_or_create(
+                    ticker=ticker,
+                    defaults={
+                        'name': asset_name,
+                        'asset_class': 'Equity',
+                        'currency': 'USD',
+                        'market': 'US'
+                    }
                 )
-            
-            return Response(
-                {'error': 'No price data available'},
-                status=status.HTTP_404_NOT_FOUND
+                # If asset already exists but name is default, update it
+                if not created and asset.name == asset.ticker and asset_name != ticker:
+                    asset.name = asset_name
+                    asset.save(update_fields=['name'])
+                serializer.validated_data['asset'] = asset
+            # Save the holding
+            holding = serializer.save()
+            # Update market price if not cash
+            price = get_or_fetch_market_price(
+                holding.asset.ticker,
+                timezone.now().date()
             )
-            
-        except Exception as e:
-            logger.error(f"Error updating price for holding {holding.id}: {str(e)}")
-            return Response(
-                {'error': f'Failed to update market price: {str(e)}'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            if price is not None:
+                holding.current_price = price
+                holding.market_value = price * holding.quantity
+                holding.save()
 
     @action(detail=True, methods=['get'])
-    def market_data(self, request, pk=None):
-        """Get market data for a specific holding"""
+    def market_value(self, request, pk=None):
         holding = self.get_object()
-        return Response({
-            'market_value': float(holding.market_value) if holding.market_value else None,
-            'unrealized_gain_loss': float(holding.unrealized_gain_loss) if holding.unrealized_gain_loss else None,
-            'last_price_update': holding.last_price_update
-        })
+        date_str = request.query_params.get('date', timezone.now().date().isoformat())
+        try:
+            target_date = date.fromisoformat(date_str)
+        except ValueError:
+            return Response(
+                {'error': 'Invalid date format. Use YYYY-MM-DD'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if holding.asset_class == 'Cash':
+            return Response({
+                'date': target_date.isoformat(),
+                'market_value': str(holding.book_cost)
+            })
+
+        if not holding.asset:
+            return Response({
+                'error': 'No asset associated with this holding'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        price = get_or_fetch_market_price(holding.asset.ticker, target_date)
+        if price is not None:
+            market_value = price * holding.quantity
+            return Response({
+                'date': target_date.isoformat(),
+                'market_value': str(market_value)
+            })
+        else:
+            return Response({
+                'error': 'Could not fetch market price'
+            }, status=status.HTTP_404_NOT_FOUND)
 
 class PortfolioNAVViewSet(viewsets.ModelViewSet):
     """
@@ -1041,3 +1191,24 @@ def get_portfolio_value(request, pk):
             {'error': 'Internal server error'}, 
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
+
+class RiskAnalyticsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, portfolio_id):
+        # TODO: Replace with real portfolio_returns and benchmark_returns
+        np.random.seed(0)
+        portfolio_returns = np.random.normal(0, 0.01, 252)
+        benchmark_returns = np.random.normal(0, 0.009, 252)
+
+        vol = np.std(portfolio_returns) * np.sqrt(252)
+        tracking_error = np.std(portfolio_returns - benchmark_returns) * np.sqrt(252)
+        value_at_risk = -np.percentile(portfolio_returns, 5)
+        forecast_risk = None  # Optional: implement if you have a model
+
+        return Response({
+            "total_risk": float(vol),
+            "forecast_risk": forecast_risk,
+            "tracking_error": float(tracking_error),
+            "value_at_risk": float(value_at_risk),
+        })

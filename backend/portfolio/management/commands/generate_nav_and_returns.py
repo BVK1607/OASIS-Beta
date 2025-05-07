@@ -7,6 +7,7 @@ from decimal import Decimal
 from portfolio.models import Portfolio, Holding, PortfolioNAV, HoldingReturn
 from portfolio.market_data import get_historical_prices
 import yfinance as yf
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -19,89 +20,85 @@ class Command(BaseCommand):
         parser.add_argument('--portfolio', type=int, help='Process only specific portfolio ID')
 
     def handle(self, *args, **options):
+        """Generate NAV and returns for all portfolios"""
         portfolios = Portfolio.objects.all()
         
         for portfolio in portfolios:
-            logger.info(f"Processing portfolio: {portfolio.name}")
+            logger.info(f"Processing portfolio {portfolio.id}")
             
-            # Get all holdings for this portfolio
-            holdings = portfolio.holdings.all()
+            # Get the earliest holding date
+            start_date = portfolio.holdings.aggregate(
+                Min('purchase_date')
+            )['purchase_date__min']
             
-            # Get the date range for NAV calculation
-            start_date = holdings.aggregate(Min('trade_date'))['trade_date__min']
             if not start_date:
-                logger.warning(f"No holdings found for portfolio {portfolio.name}")
+                logger.warning(f"No holdings found for portfolio {portfolio.id}")
                 continue
                 
-            end_date = date.today()
+            # Get all dates from start_date to today
+            dates = pd.date_range(start=start_date, end=date.today(), freq='D')
             
-            # Get all trading days first
-            trading_days = set()
-            for holding in holdings:
-                if holding.ticker:  # Only for securities, not cash
-                    try:
-                        prices = get_historical_prices(holding.ticker, start_date, end_date)
-                        if prices is not None and not prices.empty:
-                            trading_days.update(prices.index.date)
-                    except Exception as e:
-                        logger.warning(f"Error fetching prices for {holding.ticker}: {e}")
-                        continue
-            
-            trading_days = sorted(trading_days)
-            if not trading_days:
-                logger.warning(f"No trading days found for portfolio {portfolio.name}")
-                continue
+            for d in dates:
+                d = d.date()
+                logger.info(f"Processing date {d}")
                 
-            # Delete existing NAV records for recalculation
-            PortfolioNAV.objects.filter(portfolio=portfolio).delete()
-            
-            # Process each trading day
-            for current_date in trading_days:
+                # Get active holdings for this date
+                holdings = portfolio.holdings.filter(purchase_date__lte=d)
+                
+                # Calculate total value
                 total_value = Decimal('0')
-                securities_processed = False
-                
-                # Calculate total value including both securities and cash
                 for holding in holdings:
-                    # Skip holdings that haven't been purchased yet
-                    if holding.trade_date > current_date:
+                    if holding.asset_class == 'Cash':
+                        total_value += holding.book_cost
+                    else:
+                        price = get_or_fetch_market_price(holding.ticker, d)
+                        if price is None:
+                            logger.error(f"Could not get price for {holding.ticker} on {d}")
+                            continue
+                        total_value += price * holding.quantity
+                
+                # Create or update NAV record
+                nav, created = PortfolioNAV.objects.update_or_create(
+                    portfolio=portfolio,
+                    date=d,
+                    defaults={
+                        'total_value': total_value,
+                        'nav': total_value,  # For now, just use total value as NAV
+                        'last_updated': timezone.now()
+                    }
+                )
+                
+                # Calculate daily return
+                nav.daily_return = nav.calculate_daily_return()
+                nav.save()
+                
+                # Update holding returns
+                for holding in holdings:
+                    if holding.purchase_date > d:
                         continue
                         
                     if holding.asset_class == 'Cash':
-                        total_value += holding.book_cost
-                        continue
-                        
-                    try:
-                        market_data = get_market_price(holding.ticker, current_date)
-                        if market_data and market_data['price']:
-                            market_value = market_data['price'] * holding.quantity
-                            total_value += market_value
-                            securities_processed = True
-                    except Exception as e:
-                        logger.warning(f"Error getting price for {holding.ticker} on {current_date}: {str(e)}")
-                        continue
-                
-                # Only create NAV record if we successfully processed securities
-                if securities_processed:
-                    # Get previous NAV for daily return calculation
-                    prev_nav = PortfolioNAV.objects.filter(
-                        portfolio=portfolio,
-                        date__lt=current_date
-                    ).order_by('-date').first()
+                        value = holding.book_cost
+                    else:
+                        price = get_or_fetch_market_price(holding.ticker, d)
+                        if price is None:
+                            logger.error(f"Could not get price for {holding.ticker} on {d}")
+                            continue
+                        value = price * holding.quantity
                     
-                    daily_return = None
-                    if prev_nav and prev_nav.total_value > 0:
-                        daily_return = ((total_value / prev_nav.total_value) - 1) * 100
-                    
-                    # Save NAV record
-                    PortfolioNAV.objects.create(
-                        portfolio=portfolio,
-                        date=current_date,
-                        nav=total_value.quantize(Decimal('0.0001')),
-                        total_value=total_value.quantize(Decimal('0.0001')),
-                        daily_return=daily_return.quantize(Decimal('0.000001')) if daily_return is not None else None
+                    # Create or update holding return
+                    HoldingReturn.objects.update_or_create(
+                        holding=holding,
+                        date=d,
+                        defaults={
+                            'market_value': value,
+                            'last_updated': timezone.now()
+                        }
                     )
             
-            logger.info(f"Completed NAV generation for portfolio {portfolio.name}")
+            logger.info(f"Completed processing portfolio {portfolio.id}")
+        
+        self.stdout.write(self.style.SUCCESS('Successfully generated NAV and returns'))
 
     def generate_portfolio_history(self, portfolio, start_date, end_date, force=False):
         holdings = list(portfolio.holdings.all())

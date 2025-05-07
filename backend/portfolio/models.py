@@ -5,41 +5,164 @@ from django.utils import timezone
 from datetime import date, datetime, timedelta
 from django.core.exceptions import ValidationError
 import logging
-from .market_data import get_market_price, get_or_fetch_fx_rate, get_or_fetch_market_price
 from django.db.models import Sum, F, Q, Min, Max
 from typing import Optional, List, Dict, Any
 from django.db.utils import OperationalError
 import time
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
 class Portfolio(models.Model):
     RISK_TOLERANCE_CHOICES = [
-        ('Conservative', 'Conservative'),
-        ('Moderate', 'Moderate'),
-        ('Aggressive', 'Aggressive'),
+        ('Low', 'Low'),
+        ('Medium', 'Medium'),
+        ('High', 'High')
     ]
     
     CURRENCY_CHOICES = [
         ('USD', 'US Dollar'),
         ('GBP', 'British Pound'),
+        ('EUR', 'Euro')
     ]
     
     name = models.CharField(max_length=100)
-    description = models.TextField(blank=True, default='')
-    risk_tolerance = models.CharField(max_length=20, choices=RISK_TOLERANCE_CHOICES, default='Moderate')
-    target_return = models.DecimalField(max_digits=5, decimal_places=2, blank=True, null=True)
-    creation_date = models.DateField(default=timezone.now)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-    base_currency = models.CharField(max_length=3, choices=CURRENCY_CHOICES, default='USD')
-
-    class Meta:
-        db_table = 'portfolio'
-
-    def __str__(self):
-        return f"{self.name} ({self.risk_tolerance})"
+    description = models.TextField(blank=True)
+    risk_tolerance = models.CharField(
+        max_length=10,
+        choices=RISK_TOLERANCE_CHOICES,
+        default='Medium'
+    )
+    target_return = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True
+    )
+    creation_date = models.DateField(auto_now_add=True)
+    base_currency = models.CharField(
+        max_length=3,
+        choices=CURRENCY_CHOICES,
+        default='USD'
+    )
+    total_value = models.DecimalField(
+        max_digits=20,
+        decimal_places=2,
+        default=Decimal('0.00')
+    )
     
+    def __str__(self):
+        return self.name
+    
+    def validate_portfolio_data(self, target_date: date) -> bool:
+        """
+        Validate portfolio data for a given date
+        Returns True if data is valid, False otherwise
+        """
+        try:
+            # Ensure we have a date object
+            if isinstance(target_date, datetime):
+                target_date = target_date.date()
+            
+            # Check holdings
+            holdings = self.holdings.filter(purchase_date__lte=target_date)
+            if not holdings.exists():
+                logger.warning(f"No holdings found for portfolio {self.name} on {target_date}")
+                return False
+            
+            # Check market prices
+            for holding in holdings:
+                if holding.asset_class == 'Cash':
+                    continue
+                    
+                if not GlobalMarketPrice.objects.filter(
+                    asset=holding.asset,
+                    date=target_date
+                ).exists():
+                    logger.error(f"No market price found for {holding.ticker} on {target_date}")
+                    return False
+                
+            # Check NAV calculation
+            nav = self.get_nav_in_currency(self.base_currency, target_date)
+            if nav is None:
+                logger.error(f"Failed to calculate NAV for portfolio {self.name} on {target_date}")
+                return False
+            
+            # Check for significant NAV changes
+            prev_nav = self.get_nav_in_currency(self.base_currency, target_date - timedelta(days=1))
+            if prev_nav and prev_nav > 0:
+                change = abs(nav - prev_nav) / prev_nav
+                if change > Decimal('0.1'):  # 10% threshold
+                    logger.warning(f"Significant NAV change detected for portfolio {self.name} on {target_date}")
+                    return False
+            
+            return True
+        
+        except Exception as e:
+            logger.error(f"Error validating portfolio data for {self.name} on {target_date}: {str(e)}")
+            return False
+    
+    def get_nav_in_currency(self, target_currency: str, target_date: date = None) -> Optional[Decimal]:
+        """
+        Get the NAV of the portfolio in the specified currency.
+        If date is not provided, uses the current date.
+        """
+        try:
+            from .market_data import get_or_fetch_market_price
+            if target_date is None:
+                target_date = timezone.now().date()
+            elif isinstance(target_date, datetime):
+                target_date = target_date.date()
+            
+            logger.info(f"Calculating NAV in {target_currency} for portfolio {self.id} on {target_date}")
+            
+            total_value = Decimal('0')
+            for holding in self.holdings.filter(purchase_date__lte=target_date):
+                value = holding.get_value_in_currency(target_currency, target_date)
+                if value is None:
+                    logger.error(f"Could not get value for {holding.ticker} in {target_currency}")
+                    return None
+                total_value += value
+            
+            logger.info(f"Total portfolio value: {total_value} {target_currency}")
+            return total_value
+            
+        except Exception as e:
+            logger.error(f"Error getting NAV in {target_currency} for portfolio {self.id}: {e}")
+            return None
+    
+    def recalculate_nav_from_date(self, from_date: date) -> bool:
+        """
+        Recalculate NAV history from the specified date.
+        Returns True if successful, False otherwise.
+        """
+        try:
+            from .market_data import get_or_fetch_market_price
+            if isinstance(from_date, datetime):
+                from_date = from_date.date()
+                
+            # Get all dates from from_date to today
+            dates = pd.date_range(start=from_date, end=date.today(), freq='D')
+            
+            for d in dates:
+                nav = self.get_nav_in_currency(self.base_currency, d.date())
+                if nav is not None:
+                    PortfolioNAV.objects.update_or_create(
+                        portfolio=self,
+                        date=d.date(),
+                        defaults={
+                            'total_value': nav,
+                            'nav': nav,  # For now, just use the total value as NAV
+                            'last_updated': timezone.now()
+                        }
+                    )
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error recalculating NAV for portfolio {self.id}: {e}")
+            return False
+
     def update_market_prices(self):
         """Queue market price updates for all holdings"""
         from .task_queue import task_queue
@@ -60,35 +183,12 @@ class Portfolio(models.Model):
         """Calculate total unrealized gain/loss"""
         return self.total_market_value - self.total_book_cost
 
-    def recalculate_nav_from_date(self, from_date: date) -> bool:
-        """
-        Recalculate NAV history from the specified date.
-        Returns True if successful, False otherwise.
-        """
-        try:
-            # Get all dates from from_date to today
-            dates = pd.date_range(start=from_date, end=date.today(), freq='D')
-            
-            for d in dates:
-                nav = self.get_nav_in_currency(self.base_currency, d.date())
-                if nav is not None:
-                    NAVHistory.objects.update_or_create(
-                        portfolio=self,
-                        date=d.date(),
-                        defaults={'nav': nav}
-                    )
-
-            return True
-
-        except Exception as e:
-            logger.error(f"Error recalculating NAV for portfolio {self.id}: {e}")
-            return False
-
     def calculate_nav(self, date=None):
         """
         Calculate NAV for a specific date with staleness check.
         NAV is indexed to 100 at portfolio inception.
         """
+        from .market_data import get_or_fetch_market_price
         if date is None:
             date = timezone.now().date()
         
@@ -116,7 +216,7 @@ class Portfolio(models.Model):
             else:
                 # Calculate inception value if not stored
                 inception_value = Decimal('0')
-                for holding in self.holdings.filter(trade_date=inception_date):
+                for holding in self.holdings.filter(purchase_date=inception_date):
                     price = holding.get_price(inception_date)
                     if price:
                         inception_value += holding.quantity * price
@@ -125,7 +225,7 @@ class Portfolio(models.Model):
         
         # Calculate current total value
         total_value = Decimal('0')
-        for holding in self.holdings.filter(trade_date__lte=date):
+        for holding in self.holdings.filter(purchase_date__lte=date):
             price = holding.get_price(date)
             if price:
                 total_value += holding.quantity * price
@@ -135,45 +235,6 @@ class Portfolio(models.Model):
             return Decimal('100.0') * (total_value / self._inception_value)
         
         return total_value  # Return absolute value if no inception value available
-
-    def validate_portfolio_data(self, date: date) -> bool:
-        """
-        Validate portfolio data for a given date
-        Returns True if data is valid, False otherwise
-        """
-        try:
-            # Check holdings
-            holdings = self.holdings.filter(date=date)
-            if not holdings.exists():
-                logger.warning(f"No holdings found for portfolio {self.name} on {date}")
-                return False
-            
-            # Check market prices
-            for holding in holdings:
-                if not MarketPrice.objects.filter(
-                    ticker=holding.ticker,
-                    date=date
-                ).exists():
-                    logger.error(f"No market price found for {holding.ticker} on {date}")
-                    return False
-                
-            # Check NAV calculation
-            calculated_nav = self.calculate_nav(date)
-            if calculated_nav is None:
-                logger.error(f"Failed to calculate NAV for portfolio {self.name} on {date}")
-                return False
-            
-            # Check for significant NAV changes
-            prev_nav = self.calculate_nav(date - timedelta(days=1))
-            if prev_nav and abs(calculated_nav - prev_nav) / prev_nav > 0.1:  # 10% threshold
-                logger.warning(f"Significant NAV change detected for portfolio {self.name} on {date}")
-                return False
-            
-            return True
-        
-        except Exception as e:
-            logger.error(f"Error validating portfolio data for {self.name} on {date}: {str(e)}")
-            return False
 
     def check_data_consistency(self, date: date) -> Dict[str, List[str]]:
         """
@@ -265,129 +326,76 @@ class Portfolio(models.Model):
             logger.error(f"Error checking portfolio changes for {date}: {str(e)}")
             return changes
 
-    def get_nav_in_currency(self, target_currency: str, date: date = None) -> Optional[Decimal]:
-        """
-        Get the NAV of the portfolio in the specified currency.
-        If date is not provided, uses the current date.
-        """
-        try:
-            if date is None:
-                date = timezone.now().date()
-            
-            logger.info(f"Calculating NAV in {target_currency} for portfolio {self.id} on {date}")
-            
-            total_value = Decimal('0')
-            for holding in self.holdings.all():
-                logger.info(f"Processing holding {holding.ticker} ({holding.asset_class})")
-                
-                if holding.asset_class == 'Cash':
-                    value = holding.book_cost
-                    if holding.currency != target_currency:
-                        rate = get_or_fetch_fx_rate(holding.currency, target_currency, date)
-                        logger.info(f"Got FX rate for {holding.currency}/{target_currency}: {rate}")
-                        if rate is None:
-                            logger.error(f"Could not get FX rate for {holding.currency}/{target_currency}")
-                            return None
-                        value = value * rate
-                    total_value += value
-                    logger.info(f"Added cash value: {value} {target_currency}")
-                else:
-                    value = holding.get_value_in_currency(target_currency, date)
-                    if value is None:
-                        logger.error(f"Could not get value for {holding.ticker} in {target_currency}")
-                        return None
-                    total_value += value
-                    logger.info(f"Added security value: {value} {target_currency}")
+    def delete(self, *args, **kwargs):
+        # Explicitly delete all related objects in the correct order
+        self.holding_returns.all().delete()
+        self.nav_records.all().delete()
+        self.trade_history.all().delete()
+        self.market_prices.all().delete()
+        self.holdings.all().delete()
+        # If you have other related models, add them here
+        super().delete(*args, **kwargs)
 
-            logger.info(f"Total portfolio value: {total_value} {target_currency}")
-            return total_value
+class Asset(models.Model):
+    MARKET_CHOICES = [
+        ('US', 'US Market'),
+        ('UK', 'UK Market'),
+        ('EU', 'European Market'),
+    ]
+    
+    ticker = models.CharField(max_length=20, unique=True)
+    isin = models.CharField(max_length=12, unique=True, null=True, blank=True)
+    name = models.CharField(max_length=100)
+    asset_class = models.CharField(max_length=20)
+    currency = models.CharField(max_length=3, default='USD')
+    market = models.CharField(max_length=2, choices=MARKET_CHOICES, default='US')
+    last_updated = models.DateTimeField(auto_now=True)
 
-        except Exception as e:
-            logger.error(f"Error getting NAV in {target_currency} for portfolio {self.id}: {e}")
-            return None
+    class Meta:
+        db_table = 'portfolio_asset'
+        indexes = [
+            models.Index(fields=['ticker']),
+            models.Index(fields=['isin']),
+            models.Index(fields=['market']),
+        ]
+
+    def __str__(self):
+        return f"{self.ticker} ({self.name})"
 
 class Holding(models.Model):
     ASSET_CLASS_CHOICES = [
         ('Equity', 'Equity'),
         ('Fixed Income', 'Fixed Income'),
-        ('Alternatives', 'Alternatives'),
         ('Cash', 'Cash'),
+        ('Alternative', 'Alternative')
     ]
-
+    
     portfolio = models.ForeignKey(Portfolio, on_delete=models.CASCADE, related_name='holdings')
-    asset_class = models.CharField(max_length=20, choices=ASSET_CLASS_CHOICES, default='Equity')
+    asset = models.ForeignKey(Asset, on_delete=models.SET_NULL, null=True, related_name='holdings')
+    quantity = models.DecimalField(max_digits=20, decimal_places=4)
+    book_cost = models.DecimalField(max_digits=20, decimal_places=2)
+    market_value = models.DecimalField(max_digits=20, decimal_places=2, null=True)
+    asset_class = models.CharField(max_length=20, choices=ASSET_CLASS_CHOICES)
     isin = models.CharField(max_length=12, blank=True, null=True)
-    ticker = models.CharField(max_length=20, null=True, blank=True)
-    quantity = models.DecimalField(max_digits=20, decimal_places=6, default=Decimal('0'))
-    book_cost = models.DecimalField(
-        max_digits=15,
-        decimal_places=2,
-        validators=[MinValueValidator(Decimal('0.01'))],
-        default=Decimal('0'),
-    )
+    ticker = models.CharField(max_length=10, blank=True, null=True)
     currency = models.CharField(max_length=3, default='USD')
-    purchase_date = models.DateField(default=date.today)
-    purchase_price = models.DecimalField(max_digits=20, decimal_places=6, default=Decimal('0'))
-    current_price = models.DecimalField(max_digits=20, decimal_places=6, null=True, blank=True)
-    market_value = models.DecimalField(
-        max_digits=15,
-        decimal_places=2,
-        null=True,
-        blank=True
-    )
+    purchase_date = models.DateField()
+    purchase_price = models.DecimalField(max_digits=20, decimal_places=6, null=True)
     last_updated = models.DateTimeField(auto_now=True)
-
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    name = models.CharField(max_length=128, blank=True, null=True)
-
+    current_price = models.DecimalField(max_digits=20, decimal_places=6, null=True, blank=True)
+    
     class Meta:
-        db_table = 'holding'
-        constraints = [
-            models.UniqueConstraint(
-                fields=['portfolio', 'isin', 'purchase_date'],
-                condition=~models.Q(asset_class='Cash'),
-                name='unique_portfolio_isin_date_non_cash'
-            ),
-            models.CheckConstraint(
-                check=models.Q(quantity__gte=0),
-                name='positive_quantity'
-            ),
-            models.CheckConstraint(
-                check=models.Q(book_cost__gte=0),
-                name='positive_book_cost'
-            ),
-            models.CheckConstraint(
-                check=models.Q(market_value__gte=0),
-                name='positive_market_value'
-            )
-        ]
+        db_table = 'portfolio_holding'
         indexes = [
-            models.Index(fields=['portfolio', 'ticker']),
-            models.Index(fields=['ticker']),
-            models.Index(fields=['last_updated']),
-            models.Index(fields=['portfolio', '-purchase_date']),
+            models.Index(fields=['portfolio', 'asset_class'], name='holding_port_asset_idx'),
+            models.Index(fields=['ticker'], name='holding_ticker_idx'),
+            models.Index(fields=['isin'], name='holding_isin_idx'),
+            models.Index(fields=['purchase_date'], name='holding_date_idx'),
         ]
-        ordering = ['-created_at']
-
+        
     def __str__(self):
-        return f"{self.ticker or 'Unknown'} ({self.quantity} @ {self.purchase_price} {self.currency})"
+        return f"{self.ticker or self.isin} ({self.quantity})"
 
-    def clean(self):
-        """Validate the model"""
-        if self.asset_class == 'Cash':
-            if self.isin or self.ticker or self.quantity:
-                raise ValidationError('Cash positions should not have ISIN, ticker, or quantity')
-        else:
-            if not self.isin:
-                raise ValidationError('ISIN is required for non-cash holdings')
-            if not self.ticker:
-                raise ValidationError('Ticker is required for non-cash holdings')
-            if not self.quantity:
-                raise ValidationError('Quantity is required for non-cash holdings')
-
-    @transaction.atomic
     def save(self, *args, **kwargs):
         """Save the holding with proper decimal handling"""
         # Ensure consistent decimal precision
@@ -406,181 +414,124 @@ class Holding(models.Model):
                 Decimal('0.01'),
                 rounding=ROUND_HALF_UP
             )
-        if self.current_price is not None:
-            self.current_price = Decimal(str(self.current_price)).quantize(
+        if self.purchase_price is not None:
+            self.purchase_price = Decimal(str(self.purchase_price)).quantize(
+                Decimal('0.000001'),
+                rounding=ROUND_HALF_UP
+            )
+        super().save(*args, **kwargs)
+
+    def get_value_in_currency(self, target_currency: str, target_date: date = None) -> Optional[Decimal]:
+        """
+        Get the value of the holding in the specified currency.
+        If date is not provided, uses the current date.
+        """
+        try:
+            from .market_data import get_or_fetch_market_price, get_or_fetch_fx_rate
+            if target_date is None:
+                target_date = timezone.now().date()
+            elif isinstance(target_date, datetime):
+                target_date = target_date.date()
+            
+            # For cash holdings, just convert the book cost
+            if self.asset_class == 'Cash':
+                if self.currency == target_currency:
+                    return self.book_cost
+                else:
+                    fx_rate = get_or_fetch_fx_rate(self.currency, target_currency, target_date)
+                    if fx_rate is None:
+                        logger.error(f"Could not get FX rate for {self.currency}/{target_currency}")
+                        return None
+                    return self.book_cost * fx_rate
+            
+            # For other holdings, get market price and convert
+            price = get_or_fetch_market_price(self.ticker, target_date)
+            if price is None:
+                logger.error(f"Could not get price for {self.ticker} on {target_date}")
+                return None
+            
+            value = price * self.quantity
+            
+            # Convert to target currency if needed
+            if self.currency != target_currency:
+                fx_rate = get_or_fetch_fx_rate(self.currency, target_currency, target_date)
+                if fx_rate is None:
+                    logger.error(f"Could not get FX rate for {self.currency}/{target_currency}")
+                    return None
+                value = value * fx_rate
+            
+            return value
+            
+        except Exception as e:
+            logger.error(f"Error getting value in {target_currency} for holding {self.id}: {e}")
+            return None
+
+    def update_market_price(self):
+        from .market_data import get_or_fetch_market_price
+        price = get_or_fetch_market_price(self.ticker, timezone.now().date())
+        if price is not None:
+            self.current_price = price
+            self.market_value = price * self.quantity
+            self.save()
+
+class PortfolioNAV(models.Model):
+    portfolio = models.ForeignKey(Portfolio, on_delete=models.CASCADE, related_name='nav_records')
+    date = models.DateField()
+    total_value = models.DecimalField(max_digits=20, decimal_places=2)
+    nav = models.DecimalField(max_digits=20, decimal_places=2)
+    daily_return = models.DecimalField(max_digits=10, decimal_places=4, null=True)
+    last_updated = models.DateTimeField(auto_now=True)
+    is_complete = models.BooleanField(default=True)  # True if all holdings had a valid price
+    
+    class Meta:
+        db_table = 'portfolio_nav'
+        unique_together = ['portfolio', 'date']
+        indexes = [
+            models.Index(fields=['portfolio', 'date'], name='nav_port_date_idx'),
+            models.Index(fields=['date'], name='nav_date_idx'),
+        ]
+        ordering = ['-date']
+    
+    def __str__(self):
+        return f"{self.portfolio.name} NAV on {self.date}: {self.nav}"
+    
+    def save(self, *args, **kwargs):
+        """Save the NAV record with proper decimal handling"""
+        # Ensure consistent decimal precision
+        if self.total_value is not None:
+            self.total_value = Decimal(str(self.total_value)).quantize(
                 Decimal('0.01'),
                 rounding=ROUND_HALF_UP
             )
-
-        # For cash positions, set market value equal to book cost
-        if self.asset_class == 'Cash':
-            self.current_price = self.book_cost
-            self.market_value = self.book_cost
-            self.last_updated = timezone.now()
-
-        self.clean()
-        is_new = self.pk is None
-        old_holding = None if is_new else Holding.objects.select_for_update().get(pk=self.pk)
-        
-        # Save the holding first
+        if self.nav is not None:
+            self.nav = Decimal(str(self.nav)).quantize(
+                Decimal('0.01'),
+                rounding=ROUND_HALF_UP
+            )
+        if self.daily_return is not None:
+            self.daily_return = Decimal(str(self.daily_return)).quantize(
+                Decimal('0.0001'),
+                rounding=ROUND_HALF_UP
+            )
         super().save(*args, **kwargs)
-        
-        # Determine the earliest date to recalculate from
-        earliest_date = self.purchase_date
-        
-        # If this is an update, check if purchase_date changed
-        if not is_new and old_holding and old_holding.purchase_date != self.purchase_date:
-            earliest_date = min(earliest_date, old_holding.purchase_date)
-        
-        # Recalculate NAV from the earliest affected date
-        self.portfolio.recalculate_nav_from_date(earliest_date)
-
-    @transaction.atomic
-    def update_market_price(self) -> bool:
-        """
-        Update the current market price using yfinance.
-        Returns True if successful, False otherwise.
-        """
+    
+    def calculate_daily_return(self) -> Optional[Decimal]:
+        """Calculate the daily return for this NAV record"""
         try:
-            price = get_or_fetch_market_price(self.ticker, date.today())
-            if price is None:
-                return False
-
-            self.current_price = price
-            self.market_value = price * self.quantity
-            self.last_updated = timezone.now()
-            self.save()
-            return True
-
-        except Exception as e:
-            logger.error(f"Error updating market price for {self.ticker}: {e}")
-            return False
-
-    def get_value_in_currency(self, target_currency: str, date: date = None) -> Optional[Decimal]:
-        """
-        Get the value of the holding in the specified currency.
-        If date is not provided, uses the current price.
-        """
-        try:
-            logger.info(f"Getting value for {self.ticker} in {target_currency} on {date}")
+            # Get previous day's NAV
+            prev_nav = PortfolioNAV.objects.filter(
+                portfolio=self.portfolio,
+                date__lt=self.date
+            ).order_by('-date').first()
             
-            # For cash positions, just convert the book cost
-            if self.asset_class == 'Cash':
-                if self.currency == target_currency:
-                    logger.info(f"Cash position in same currency: {self.book_cost} {self.currency}")
-                    return self.book_cost
-                rate = get_or_fetch_fx_rate(self.currency, target_currency, date or timezone.now().date())
-                logger.info(f"Got FX rate for cash: {self.currency}/{target_currency} = {rate}")
-                if rate is None:
-                    logger.error(f"Could not get FX rate for cash: {self.currency}/{target_currency}")
-                    return None
-                value = self.book_cost * rate
-                logger.info(f"Converted cash value: {self.book_cost} {self.currency} = {value} {target_currency}")
-                return value
-
-            # For securities, get the price and convert
-            if date is None:
-                price = self.current_price
-                logger.info(f"Current price for {self.ticker}: {price}")
-                if price is None:
-                    # Try to fetch current price
-                    price_data = get_market_price(self.ticker)
-                    logger.info(f"Fetched current price data: {price_data}")
-                    if price_data and price_data.get('price'):
-                        price = price_data['price']
-                    else:
-                        logger.error(f"Could not get current price for {self.ticker}")
-                        return None
-            else:
-                # Try to get historical price
-                market_price = MarketPrice.objects.filter(
-                    ticker=self.ticker,
-                    date=date
-                ).first()
-                if market_price:
-                    price = market_price.price
-                    logger.info(f"Got historical price from DB: {price}")
-                else:
-                    # Try to fetch historical price
-                    price_data = get_or_fetch_market_price(self.ticker, date)
-                    logger.info(f"Fetched historical price data: {price_data}")
-                    if price_data and price_data.get('price'):
-                        price = price_data['price']
-                    else:
-                        logger.error(f"Could not get historical price for {self.ticker} on {date}")
-                        return None
-
-            value = self.quantity * price
-            logger.info(f"Base value: {value} {self.currency}")
+            if not prev_nav or prev_nav.nav == 0:
+                return None
             
-            if self.currency != target_currency:
-                rate = get_or_fetch_fx_rate(self.currency, target_currency, date or timezone.now().date())
-                logger.info(f"Got FX rate: {self.currency}/{target_currency} = {rate}")
-                if rate is None:
-                    logger.error(f"Could not get FX rate: {self.currency}/{target_currency}")
-                    return None
-                value = value * rate
-                logger.info(f"Converted value: {value} {target_currency}")
-            return value
-
+            # Calculate return
+            return (self.nav - prev_nav.nav) / prev_nav.nav
         except Exception as e:
-            logger.error(f"Error getting value in {target_currency} for {self.ticker}: {e}")
+            logger.error(f"Error calculating daily return for {self}: {e}")
             return None
-
-    def get_price(self, date) -> Optional[Decimal]:
-        """
-        Get the price for this holding on a specific date.
-        Returns None if no price is available.
-        """
-        if self.asset_class == 'Cash':
-            return self.book_cost
-
-        try:
-            # Try to get from MarketPrice first
-            market_price = MarketPrice.objects.filter(
-                ticker=self.ticker,
-                date=date
-            ).first()
-
-            if market_price:
-                return market_price.price
-
-            # If not found, try to fetch from market data
-            from .market_data import get_or_fetch_market_price
-            price_data = get_or_fetch_market_price(self.ticker, date)
-            if price_data and price_data.get('price'):
-                return price_data['price']
-
-            return None
-
-        except Exception as e:
-            logger.error(f"Error getting price for {self.ticker} on {date}: {str(e)}")
-            return None
-
-class PortfolioNAV(models.Model):
-    """
-    Stores daily portfolio NAV and total value.
-    total_value: The actual sum of all holdings' market values
-    nav: The indexed NAV value, rebased to 100 at portfolio start
-    """
-    portfolio = models.ForeignKey(Portfolio, on_delete=models.CASCADE, related_name='navs')
-    date = models.DateField()
-    total_value = models.DecimalField(max_digits=20, decimal_places=2)
-    nav = models.DecimalField(max_digits=20, decimal_places=6)
-    daily_return = models.DecimalField(max_digits=10, decimal_places=6, null=True)
-    last_updated = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = 'portfolio_nav'
-        indexes = [
-            models.Index(fields=['portfolio', 'date'], name='portfolio_nav_port_date_idx'),
-            models.Index(fields=['date'], name='idx_portfolio_nav_date'),
-        ]
-        unique_together = ('portfolio', 'date')
-        ordering = ['date']
-
-    def __str__(self):
-        return f"{self.portfolio.name} NAV on {self.date}"
 
 class HoldingReturn(models.Model):
     """
@@ -593,126 +544,62 @@ class HoldingReturn(models.Model):
     market_value = models.DecimalField(max_digits=15, decimal_places=2, null=True)
 
     class Meta:
-        db_table = 'holding_returns'
+        db_table = 'portfolio_holding_return'
         indexes = [
             models.Index(fields=['portfolio', 'date'], name='holding_returns_port_date_idx'),
             models.Index(fields=['holding', 'date'], name='holding_returns_hold_date_idx'),
         ]
         unique_together = [['portfolio', 'holding', 'date']]
+        ordering = ['-date']
 
     def __str__(self):
-        return f"{self.holding.ticker if self.holding else 'Unknown'} return on {self.date}: {self.daily_return}%"
+        return f"{self.portfolio.name} - {self.holding.ticker if self.holding else 'No Holding'} - {self.date}"
 
     @classmethod
     def calculate_return(cls, current_value: Decimal, previous_value: Decimal) -> Optional[Decimal]:
-        """Calculate daily return with proper handling of edge cases"""
-        if not previous_value or previous_value <= 0:
+        if not previous_value or previous_value == 0:
             return None
-        return ((current_value / previous_value) - Decimal('1')) * Decimal('100')
+        return (current_value - previous_value) / previous_value
 
     @classmethod
     def calculate_and_save(cls, portfolio, holding, date):
         """
-        Calculate and save holding return using stored market prices
+        Calculate and save holding return for a specific date
         """
         try:
-            # Get market price for the current date
-            current_price = MarketPrice.objects.filter(
-                ticker=holding.ticker,
-                date=date
-            ).first()
-
-            if not current_price:
-                logger.warning(f"No market price found for {holding.ticker} on {date}")
-                return None
-
-            # Calculate market value
-            market_value = current_price.price * holding.quantity
-
-            # Get previous return for comparison
+            # Get previous day's market value
             prev_return = cls.objects.filter(
+                portfolio=portfolio,
                 holding=holding,
                 date__lt=date
             ).order_by('-date').first()
 
-            daily_return = None
-            if prev_return and prev_return.market_value:
-                daily_return = cls.calculate_return(market_value, prev_return.market_value)
+            if not prev_return:
+                return None
 
-            # Create or update return record
-            return cls.objects.update_or_create(
-                portfolio=portfolio,
+            # Calculate return
+            current_value = holding.market_value
+            if not current_value:
+                return None
+
+            daily_return = cls.calculate_return(current_value, prev_return.market_value)
+
+            # Create or update the return record
+            return_obj, created = cls.objects.update_or_create(
+                portfolio=portfolio,  # Ensure portfolio is set
                 holding=holding,
                 date=date,
                 defaults={
-                    'market_value': market_value,
-                    'daily_return': daily_return
+                    'daily_return': daily_return,
+                    'market_value': current_value
                 }
-            )[0]
+            )
+
+            return return_obj
 
         except Exception as e:
-            logger.error(f"Error calculating return for {holding.ticker} on {date}: {str(e)}")
+            logger.error(f"Error calculating holding return: {e}")
             return None
-
-    @classmethod
-    def bulk_calculate_returns(cls, portfolio, date):
-        """
-        Efficiently calculate returns for multiple holdings using stored market prices
-        """
-        try:
-            # Get all active holdings for the portfolio
-            holdings = portfolio.holdings.filter(purchase_date__lte=date)
-
-            # Get market prices for all holdings on this date
-            market_prices = {
-                mp.ticker: mp.price
-                for mp in MarketPrice.objects.filter(
-                    ticker__in=holdings.values_list('ticker', flat=True),
-                    date=date
-                )
-            }
-
-            # Get previous returns for all holdings
-            prev_returns = {
-                hr.holding_id: hr
-                for hr in cls.objects.filter(
-                    portfolio=portfolio,
-                    holding__in=holdings,
-                    date__lt=date
-                ).order_by('holding_id', '-date')
-            }
-
-            # Prepare bulk creation data
-            returns_to_create = []
-            for holding in holdings:
-                if holding.ticker not in market_prices:
-                    continue
-
-                market_value = market_prices[holding.ticker] * holding.quantity
-                prev_return = prev_returns.get(holding.id)
-                daily_return = None
-
-                if prev_return and prev_return.market_value:
-                    daily_return = cls.calculate_return(market_value, prev_return.market_value)
-
-                returns_to_create.append(cls(
-                    portfolio=portfolio,
-                    holding=holding,
-                    date=date,
-                    market_value=market_value,
-                    daily_return=daily_return
-                ))
-
-            # Bulk create with ignore_conflicts to handle race conditions
-            if returns_to_create:
-                cls.objects.bulk_create(
-                    returns_to_create,
-                    ignore_conflicts=True,
-                    batch_size=100
-                )
-
-        except Exception as e:
-            logger.error(f"Error in bulk return calculation for portfolio {portfolio.id} on {date}: {str(e)}")
 
 class BenchmarkReturn(models.Model):
     benchmark_name = models.CharField(max_length=50)
@@ -723,7 +610,7 @@ class BenchmarkReturn(models.Model):
     return_index = models.DecimalField(max_digits=20, decimal_places=6, null=True)
 
     class Meta:
-        db_table = 'benchmark_return'
+        db_table = 'portfolio_benchmark_return'
         unique_together = ('benchmark_name', 'date')
         indexes = [
             models.Index(fields=['benchmark_name', 'date'], name='bench_name_date_idx'),
@@ -743,7 +630,7 @@ class RebalancePlan(models.Model):
     executed = models.BooleanField(default=False)
 
     class Meta:
-        db_table = 'rebalance_plan'
+        db_table = 'portfolio_rebalance_plan'
 
     def __str__(self):
         return f"RebalancePlan for {self.portfolio.name} at {self.date_created}"
@@ -773,7 +660,7 @@ class TradeHistory(models.Model):
     notes = models.TextField(blank=True, null=True)
 
     class Meta:
-        db_table = 'trade_history'
+        db_table = 'portfolio_trade_history'
 
     def save(self, *args, **kwargs):
         # Calculate cash_flow_impact: negative for buys, positive for sells
@@ -791,27 +678,21 @@ class TradeHistory(models.Model):
 
 class MarketPrice(models.Model):
     """
-    Stores historical market prices for tickers.
-    Each price is associated with a portfolio.
+    Legacy model for backward compatibility
     """
-    portfolio = models.ForeignKey(
-        Portfolio,
-        on_delete=models.CASCADE,
-        related_name='market_prices'
-    )
+    portfolio = models.ForeignKey(Portfolio, on_delete=models.CASCADE, related_name='market_prices')
     ticker = models.CharField(max_length=20)
     date = models.DateField()
-    price = models.DecimalField(max_digits=20, decimal_places=4)
+    price = models.DecimalField(max_digits=20, decimal_places=6)
     last_updated = models.DateTimeField(auto_now=True)
 
     class Meta:
-        db_table = 'portfolio_marketprice'
+        db_table = 'portfolio_market_price_legacy'
         unique_together = ('portfolio', 'ticker', 'date')
         indexes = [
-            models.Index(fields=['ticker'], name='mp_ticker_idx'),
-            models.Index(fields=['date'], name='mp_date_idx'),
-            models.Index(fields=['portfolio', 'ticker'], name='mp_port_ticker_idx'),
-            models.Index(fields=['portfolio', 'ticker', 'date'], name='mp_port_ticker_date_idx'),
+            models.Index(fields=['ticker']),
+            models.Index(fields=['date']),
+            models.Index(fields=['portfolio', 'ticker']),
         ]
 
     def __str__(self):
@@ -829,7 +710,7 @@ class FXRate(models.Model):
     last_updated = models.DateTimeField(auto_now=True)
 
     class Meta:
-        db_table = 'fx_rate'
+        db_table = 'portfolio_fx_rate'
         unique_together = ('base_currency', 'target_currency', 'date')
         indexes = [
             models.Index(fields=['base_currency', 'target_currency', 'date']),
@@ -837,3 +718,25 @@ class FXRate(models.Model):
 
     def __str__(self):
         return f"{self.base_currency}/{self.target_currency} = {self.rate} on {self.date}"
+
+class GlobalMarketPrice(models.Model):
+    """
+    New global price model
+    """
+    asset = models.ForeignKey(Asset, on_delete=models.CASCADE, related_name='global_prices')
+    date = models.DateField()
+    price = models.DecimalField(max_digits=20, decimal_places=6)
+    is_trading_day = models.BooleanField(default=True)
+    last_updated = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'portfolio_global_market_price'
+        unique_together = ('asset', 'date')
+        indexes = [
+            models.Index(fields=['asset', 'date']),
+            models.Index(fields=['date']),
+            models.Index(fields=['is_trading_day']),
+        ]
+
+    def __str__(self):
+        return f"{self.asset.ticker} - {self.date}: {self.price}"

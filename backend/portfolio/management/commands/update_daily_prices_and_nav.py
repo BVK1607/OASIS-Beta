@@ -1,7 +1,7 @@
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 from django.db import transaction
-from django.db.models import Min, Max
+from django.db.models import Min, Max, Q
 from portfolio.models import Portfolio, Holding, PortfolioNAV, HoldingReturn, BenchmarkReturn, MarketPrice
 from portfolio.market_data import get_or_fetch_market_price, fetch_and_store_historical_prices
 from decimal import Decimal
@@ -11,6 +11,7 @@ import pandas as pd
 import yfinance as yf
 from django.db.utils import OperationalError
 import time
+from ...models import Asset, GlobalMarketPrice
 
 logger = logging.getLogger(__name__)
 
@@ -23,30 +24,31 @@ BENCHMARKS = {
 }
 
 class Command(BaseCommand):
-    help = 'Update and backfill NAV, holdings returns, and benchmark returns'
-
-    def add_arguments(self, parser):
-        parser.add_argument(
-            '--force',
-            action='store_true',
-            help='Force update even if data already exists'
-        )
+    help = 'Update daily market prices and NAV for all portfolios'
 
     def handle(self, *args, **options):
+        """Update daily market prices and NAV for all portfolios"""
         force = options.get('force', False)
-        today = timezone.now().date()
+        today = timezone.now().date()  # Use current date instead of hardcoded test date
         
-        logger.info(f"Starting daily update for {today}")
+        logger.info("Starting daily update process")
         
         # Process each portfolio
-        for portfolio in Portfolio.objects.all():
+        portfolios = Portfolio.objects.all()
+        for portfolio in portfolios:
             try:
                 self.process_portfolio(portfolio, force, today)
             except Exception as e:
                 logger.error(f"Error processing portfolio {portfolio.id}: {e}")
                 continue
-                
-        logger.info("Daily update completed")
+        
+        # Update benchmark returns
+        try:
+            self.update_benchmark_returns(force, today)
+        except Exception as e:
+            logger.error(f"Error updating benchmark returns: {e}")
+            
+        logger.info("Daily update process complete")
 
     def process_portfolio(self, portfolio, force, today):
         """Process a single portfolio's NAV and returns"""
@@ -56,8 +58,8 @@ class Command(BaseCommand):
             # Determine start date for backfill
             if force:
                 start_date = Holding.objects.filter(portfolio=portfolio).aggregate(
-                    Min('trade_date')
-                )['trade_date__min']
+                    Min('purchase_date')
+                )['purchase_date__min']
                 if not start_date:
                     logger.info(f"No holdings found for portfolio {portfolio.id}")
                     return
@@ -67,8 +69,8 @@ class Command(BaseCommand):
                     start_date = latest_nav.date + timedelta(days=1)
                 else:
                     start_date = Holding.objects.filter(portfolio=portfolio).aggregate(
-                        Min('trade_date')
-                    )['trade_date__min']
+                        Min('purchase_date')
+                    )['purchase_date__min']
                     if not start_date:
                         logger.info(f"No holdings found for portfolio {portfolio.id}")
                         return
@@ -82,17 +84,19 @@ class Command(BaseCommand):
             
             # Get all holdings that existed during the period
             holdings = Holding.objects.filter(
-                portfolio=portfolio,
-                trade_date__lte=today
-            ).exclude(asset_class='Cash')
+                Q(portfolio=portfolio) & 
+                Q(purchase_date__lte=today) & 
+                ~Q(asset_class='Cash')
+            )
             
-            # Prefetch all required historical prices upfront
-            self.prefetch_prices(holdings, start_date, today)
+            # First, ensure we have all historical prices
+            for holding in holdings:
+                logger.info(f"Fetching historical prices for {holding.ticker} from {start_date} to {today}")
+                success = fetch_and_store_historical_prices(holding.ticker, start_date, today)
+                if not success:
+                    logger.warning(f"Failed to fetch historical prices for {holding.ticker}")
             
-            # Get first NAV for indexing
-            first_nav = None
-            
-            # Process each date
+            # Now process each date
             current_date = start_date
             prev_nav = None
             
@@ -100,95 +104,55 @@ class Command(BaseCommand):
                 if current_date.weekday() >= 5:  # Skip weekends
                     current_date += timedelta(days=1)
                     continue
-                    
-                # Calculate portfolio value outside transaction
+                
+                # Calculate portfolio value
                 total_value = Decimal('0')
-                holding_updates = []  # Store updates to apply in transaction
-                active_holdings = holdings.filter(trade_date__lte=current_date)
+                holding_updates = []
+                active_holdings = holdings.filter(purchase_date__lte=current_date)
                 
                 for holding in active_holdings:
-                    try:
-                        market_data = get_or_fetch_market_price(holding.ticker, current_date)
-                        if not market_data or not market_data.get('price'):
-                            continue
-                            
-                        price = market_data['price']
-                        market_value = price * holding.quantity
-                        total_value += market_value
-                        
-                        # Prepare holding return data
-                        holding_updates.append({
-                            'holding': holding,
-                            'market_value': market_value,
-                            'price': price
-                        })
-                        
-                    except Exception as e:
-                        logger.error(f"Error processing holding {holding.ticker} on {current_date}: {e}")
+                    if holding.asset_class == 'Cash':
+                        total_value += holding.book_cost
                         continue
+                    
+                    price = get_or_fetch_market_price(holding.ticker, current_date)
+                    if price is None:
+                        logger.warning(f"No price available for {holding.ticker} on {current_date}")
+                        continue
+                    
+                    market_value = price * holding.quantity
+                    total_value += market_value
+                    
+                    # Update holding's market value
+                    holding.market_value = market_value
+                    holding_updates.append(holding)
                 
-                # Add cash positions
-                cash_holdings = portfolio.holdings.filter(
-                    asset_class='Cash',
-                    trade_date__lte=current_date
+                # Calculate daily return
+                daily_return = None
+                if prev_nav is not None and prev_nav > 0:
+                    daily_return = (total_value - prev_nav) / prev_nav
+                
+                # Create or update NAV record
+                nav_obj, created = PortfolioNAV.objects.update_or_create(
+                    portfolio=portfolio,
+                    date=current_date,
+                    defaults={
+                        'total_value': total_value,
+                        'nav': total_value,
+                        'daily_return': daily_return,
+                        'last_updated': timezone.now()
+                    }
                 )
-                for cash in cash_holdings:
-                    total_value += cash.book_cost
                 
-                # Calculate NAV and returns
-                if not first_nav:
-                    first_nav = total_value
-                    nav_value = Decimal('100.0')
-                    daily_return = None
-                else:
-                    nav_value = Decimal('100.0') * (total_value / first_nav)
-                    if prev_nav and prev_nav.total_value > 0:
-                        daily_return = ((total_value / prev_nav.total_value) - 1) * 100
-                    else:
-                        daily_return = None
+                # Update holdings in bulk
+                if holding_updates:
+                    Holding.objects.bulk_update(holding_updates, ['market_value'])
                 
-                # Apply updates in a single transaction
-                max_retries = 3
-                retry_delay = 1
-                
-                for attempt in range(max_retries):
-                    try:
-                        with transaction.atomic():
-                            # Create NAV entry
-                            nav = PortfolioNAV.objects.create(
-                                portfolio=portfolio,
-                                date=current_date,
-                                total_value=total_value,
-                                nav=nav_value,
-                                daily_return=daily_return
-                            )
-                            prev_nav = nav
-                            
-                            # Bulk create holding returns
-                            holding_returns = [
-                                HoldingReturn(
-                                    portfolio=portfolio,
-                                    holding=update['holding'],
-                                    date=current_date,
-                                    market_value=update['market_value']
-                                ) for update in holding_updates
-                            ]
-                            
-                            if holding_returns:
-                                HoldingReturn.objects.bulk_create(holding_returns)
-                            
-                            logger.info(f"Updated NAV for portfolio {portfolio.id} on {current_date}: TV={total_value}, NAV={nav_value}")
-                            break
-                            
-                    except OperationalError as e:
-                        if attempt == max_retries - 1:
-                            logger.error(f"Failed to update after {max_retries} attempts on {current_date}: {e}")
-                            raise
-                        time.sleep(retry_delay)
-                        retry_delay *= 2  # Exponential backoff
-                        
+                prev_nav = total_value
                 current_date += timedelta(days=1)
-                
+            
+            logger.info(f"Completed processing portfolio {portfolio.id}")
+            
         except Exception as e:
             logger.error(f"Error processing portfolio {portfolio.id}: {e}")
 
@@ -268,4 +232,77 @@ class Command(BaseCommand):
                 if not success:
                     logger.warning(f"Failed to prefetch prices for {holding.ticker}")
             except Exception as e:
-                logger.error(f"Error prefetching prices for {holding.ticker}: {e}") 
+                logger.error(f"Error prefetching prices for {holding.ticker}: {e}")
+
+    def get_earliest_date(self, portfolio):
+        """Get the earliest date to start updating from"""
+        earliest_holding_date = portfolio.holdings.aggregate(
+            Min('purchase_date')
+        )['purchase_date__min']
+        
+        earliest_nav_date = portfolio.nav_records.aggregate(
+            Min('date')
+        )['date__min']
+        
+        if earliest_holding_date and earliest_nav_date:
+            return min(earliest_holding_date, earliest_nav_date)
+        elif earliest_holding_date:
+            return earliest_holding_date
+        elif earliest_nav_date:
+            return earliest_nav_date
+        else:
+            return None
+
+    def update_portfolio_prices(self, portfolio, current_date):
+        """Update market prices for all holdings in a portfolio"""
+        # Get active holdings for this date
+        active_holdings = portfolio.holdings.filter(purchase_date__lte=current_date)
+        
+        for holding in active_holdings:
+            if holding.asset_class == 'Cash':
+                continue
+            
+            # Update market price
+            price = get_or_fetch_market_price(holding.ticker, current_date)
+            if price is None:
+                logger.error(f"Could not get price for {holding.ticker} on {current_date}")
+                continue
+            
+            # Update market value
+            holding.market_value = price * holding.quantity
+            holding.save()
+
+    def update_portfolio_nav(self, portfolio, current_date):
+        """Update NAV for a portfolio on a given date"""
+        try:
+            # Get active holdings for this date
+            active_holdings = portfolio.holdings.filter(purchase_date__lte=current_date)
+            
+            # Calculate total value
+            total_value = Decimal('0')
+            for holding in active_holdings:
+                if holding.market_value is None:
+                    logger.error(f"No market value for holding {holding.id} on {current_date}")
+                    continue
+                total_value += holding.market_value
+            
+            # Create or update NAV record
+            nav, created = PortfolioNAV.objects.update_or_create(
+                portfolio=portfolio,
+                date=current_date,
+                defaults={
+                    'total_value': total_value,
+                    'nav': total_value,  # For now, just use total value as NAV
+                    'last_updated': timezone.now()
+                }
+            )
+            
+            # Calculate daily return
+            nav.daily_return = nav.calculate_daily_return()
+            nav.save()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating NAV for portfolio {portfolio.id}: {e}")
+            return False 

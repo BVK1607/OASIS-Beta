@@ -76,8 +76,8 @@ class Command(BaseCommand):
             self.stdout.write('\n4. Checking for orphaned records...')
             cursor.execute("""
                 SELECT 
-                    (SELECT COUNT(*) FROM portfolio_marketprice WHERE portfolio_id IS NULL) as orphaned_prices,
-                    (SELECT COUNT(*) FROM holding_returns WHERE portfolio_id IS NULL) as orphaned_returns,
+                    (SELECT COUNT(*) FROM portfolio_global_market_price WHERE portfolio_id IS NULL) as orphaned_prices,
+                    (SELECT COUNT(*) FROM portfolio_holding_return WHERE portfolio_id IS NULL) as orphaned_returns,
                     (SELECT COUNT(*) FROM portfolio_nav WHERE portfolio_id IS NULL) as orphaned_navs
             """)
             orphaned = cursor.fetchone()
@@ -107,8 +107,8 @@ class Command(BaseCommand):
             self.stdout.write('\n6. Checking for date consistency...')
             cursor.execute("""
                 SELECT 
-                    (SELECT COUNT(*) FROM portfolio_marketprice WHERE date > CURRENT_DATE) as future_prices,
-                    (SELECT COUNT(*) FROM holding_returns WHERE date > CURRENT_DATE) as future_returns,
+                    (SELECT COUNT(*) FROM portfolio_global_market_price WHERE date > CURRENT_DATE) as future_prices,
+                    (SELECT COUNT(*) FROM portfolio_holding_return WHERE date > CURRENT_DATE) as future_returns,
                     (SELECT COUNT(*) FROM portfolio_nav WHERE date > CURRENT_DATE) as future_navs
             """)
             future_dates = cursor.fetchone()

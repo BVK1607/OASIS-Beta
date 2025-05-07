@@ -23,12 +23,12 @@ class Command(BaseCommand):
             expected_tables = [
                 'portfolio',
                 'holding',
-                'holding_returns',
+                'portfolio_holding_return',
                 'portfolio_nav',
-                'portfolio_marketprice',
-                'benchmark_return',
-                'rebalance_plan',
-                'trade_history'
+                'portfolio_global_market_price',
+                'portfolio_benchmark_return',
+                'portfolio_rebalance_plan',
+                'portfolio_trade_history'
             ]
             
             for table in tables:
@@ -83,11 +83,11 @@ class Command(BaseCommand):
 
             cursor.execute("""
                 SELECT COUNT(*) 
-                FROM holding_returns 
+                FROM portfolio_holding_return 
                 WHERE daily_return IS NULL
             """)
             null_returns = cursor.fetchone()[0]
             if null_returns > 0:
-                self.stdout.write(self.style.ERROR(f"Found {null_returns} NULL values in holding_returns"))
+                self.stdout.write(self.style.ERROR(f"Found {null_returns} NULL values in portfolio_holding_return"))
 
         self.stdout.write(self.style.SUCCESS("\nDatabase state check completed")) 

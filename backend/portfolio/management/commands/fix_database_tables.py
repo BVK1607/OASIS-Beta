@@ -45,12 +45,12 @@ class Command(BaseCommand):
                     cursor.execute("""
                         INSERT INTO holding_returns (portfolio_id, holding_id, date, daily_return)
                         SELECT portfolio_id, holding_id, date, daily_return
-                        FROM portfolio_holdingreturn
+                        FROM portfolio_holding_return
                         WHERE NOT EXISTS (
                             SELECT 1 FROM holding_returns hr
-                            WHERE hr.portfolio_id = portfolio_holdingreturn.portfolio_id
-                            AND hr.holding_id = portfolio_holdingreturn.holding_id
-                            AND hr.date = portfolio_holdingreturn.date
+                            WHERE hr.portfolio_id = portfolio_holding_return.portfolio_id
+                            AND hr.holding_id = portfolio_holding_return.holding_id
+                            AND hr.date = portfolio_holding_return.date
                         )
                     """)
                     
@@ -58,11 +58,11 @@ class Command(BaseCommand):
                     cursor.execute("""
                         INSERT INTO portfolio_nav (portfolio_id, date, total_value, nav)
                         SELECT portfolio_id, date, total_value, nav
-                        FROM portfolio_portfolionav
+                        FROM portfolio_nav
                         WHERE NOT EXISTS (
                             SELECT 1 FROM portfolio_nav pn
-                            WHERE pn.portfolio_id = portfolio_portfolionav.portfolio_id
-                            AND pn.date = portfolio_portfolionav.date
+                            WHERE pn.portfolio_id = portfolio_nav.portfolio_id
+                            AND pn.date = portfolio_nav.date
                         )
                     """)
                     
@@ -80,12 +80,12 @@ class Command(BaseCommand):
                     # Step 4: Verify the migration
                     cursor.execute("SELECT COUNT(*) FROM holding_returns")
                     new_returns_count = cursor.fetchone()[0]
-                    cursor.execute("SELECT COUNT(*) FROM portfolio_holdingreturn")
+                    cursor.execute("SELECT COUNT(*) FROM portfolio_holding_return")
                     old_returns_count = cursor.fetchone()[0]
                     
                     cursor.execute("SELECT COUNT(*) FROM portfolio_nav")
                     new_nav_count = cursor.fetchone()[0]
-                    cursor.execute("SELECT COUNT(*) FROM portfolio_portfolionav")
+                    cursor.execute("SELECT COUNT(*) FROM portfolio_nav")
                     old_nav_count = cursor.fetchone()[0]
                     
                     self.stdout.write(self.style.SUCCESS(f"""
@@ -95,8 +95,8 @@ class Command(BaseCommand):
                     """))
                     
                     # Step 5: Drop old tables (commented out for safety - uncomment after verification)
-                    # cursor.execute("DROP TABLE IF EXISTS portfolio_holdingreturn")
-                    # cursor.execute("DROP TABLE IF EXISTS portfolio_portfolionav")
+                    # cursor.execute("DROP TABLE IF EXISTS portfolio_holding_return")
+                    # cursor.execute("DROP TABLE IF EXISTS portfolio_nav")
                     
             except Exception as e:
                 self.stdout.write(self.style.ERROR(f"Error during migration: {str(e)}"))

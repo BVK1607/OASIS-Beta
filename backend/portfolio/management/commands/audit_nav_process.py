@@ -86,7 +86,7 @@ class Command(BaseCommand):
             for nav_record in navs:
                 # Calculate expected NAV from holdings
                 holdings_value = Decimal('0')
-                holdings_on_date = portfolio.holdings.filter(trade_date__lte=nav_record.date)
+                holdings_on_date = portfolio.holdings.filter(purchase_date__lte=nav_record.date)
                 
                 for holding in holdings_on_date:
                     if holding.asset_class == 'Cash':
@@ -162,4 +162,40 @@ class Command(BaseCommand):
             if missing_dates:
                 self.stdout.write(f'- Portfolio {portfolio.name} missing NAV for dates: {missing_dates}')
 
-        self.stdout.write('\nNAV process audit complete.') 
+        self.stdout.write('\nNAV process audit complete.')
+
+    def audit_nav_calculation(self, portfolio, nav_record):
+        """Audit NAV calculation for a specific record"""
+        try:
+            # Get holdings active on this date
+            holdings_on_date = portfolio.holdings.filter(purchase_date__lte=nav_record.date)
+            
+            # Calculate expected total value
+            expected_total = Decimal('0')
+            for holding in holdings_on_date:
+                if holding.asset_class == 'Cash':
+                    expected_total += holding.book_cost
+                else:
+                    price = MarketPrice.objects.filter(
+                        ticker=holding.ticker,
+                        date=nav_record.date
+                    ).first()
+                    
+                    if price is None:
+                        logger.error(f"Could not get price for {holding.ticker} on {nav_record.date}")
+                        continue
+                    expected_total += price * holding.quantity
+            
+            # Compare with recorded value
+            if abs(expected_total - nav_record.total_value) > Decimal('0.01'):
+                logger.error(
+                    f"NAV mismatch for portfolio {portfolio.id} on {nav_record.date}: "
+                    f"expected={expected_total}, actual={nav_record.total_value}"
+                )
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error auditing NAV for portfolio {portfolio.id}: {e}")
+            return False 

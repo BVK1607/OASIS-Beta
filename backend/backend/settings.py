@@ -159,13 +159,22 @@ REST_FRAMEWORK = {
 # Cache settings
 CACHES = {
     'default': {
-        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
-        'LOCATION': 'unique-snowflake',
-        'TIMEOUT': 300,  # 5 minutes
+        'BACKEND': 'django_redis.cache.RedisCache',
+        'LOCATION': 'redis://127.0.0.1:6379/1',
         'OPTIONS': {
-            'MAX_ENTRIES': 1000,
-            'CULL_FREQUENCY': 3,
-        }
+            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+            'SOCKET_CONNECT_TIMEOUT': 5,
+            'SOCKET_TIMEOUT': 5,
+            'RETRY_ON_TIMEOUT': True,
+            'MAX_CONNECTIONS': 1000,
+            'COMPRESSOR_CLASS': 'django_redis.compressors.zlib.ZlibCompressor',
+            'COMPRESSOR_CLASS_KWARGS': {
+                'level': 5,
+            },
+            'IGNORE_EXCEPTIONS': True,
+        },
+        'KEY_PREFIX': 'oasis',
+        'TIMEOUT': 60 * 60,  # 1 hour
     }
 }
 
