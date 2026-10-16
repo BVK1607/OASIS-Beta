@@ -89,7 +89,17 @@ Some tests call Yahoo Finance and can fail when it rate-limits requests.
 
 ### Frontend
 
-> **Note:** `frontend/` is recorded as a git submodule, but the repo has no `.gitmodules` file, so a fresh clone gets an empty folder. To fix this, add the frontend repo as a proper submodule (`git submodule add <frontend-repo-url> frontend`) or commit the frontend code directly.
+The frontend lives in a separate repo ([OASIS-Final](https://github.com/BVK1607/OASIS-Final)) and is included as a git submodule. Clone with:
+
+```bash
+git clone --recurse-submodules https://github.com/BVK1607/OASIS-Beta.git
+```
+
+or, in an existing clone:
+
+```bash
+git submodule update --init
+```
 
 1. Go to the frontend directory:
    ```bash
