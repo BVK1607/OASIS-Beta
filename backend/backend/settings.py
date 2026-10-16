@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.0/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -20,12 +21,16 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/5.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = "django-insecure-3ozgavivl2llp@r393)lr%-wd3+0b6txte)#@+au)w9)+q-t%a"
+# Set DJANGO_SECRET_KEY in the environment; the fallback is for local development only.
+SECRET_KEY = os.environ.get(
+    "DJANGO_SECRET_KEY",
+    "django-insecure-local-dev-only-change-me",
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.environ.get("DJANGO_DEBUG", "True").lower() in ("1", "true", "yes")
 
-ALLOWED_HOSTS = ['localhost', '127.0.0.1']
+ALLOWED_HOSTS = os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
 
 
 # Application definition
@@ -42,7 +47,6 @@ INSTALLED_APPS = [
     "portfolio",
     "analytics",
     "learning",
-    'django_redis',
 ]
 
 MIDDLEWARE = [
@@ -54,8 +58,6 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
-    'django.middleware.cache.UpdateCacheMiddleware',
-    'django.middleware.cache.FetchFromCacheMiddleware',
 ]
 
 ROOT_URLCONF = "backend.urls"
@@ -138,11 +140,9 @@ STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # CORS settings
-CORS_ALLOW_ALL_ORIGINS = True
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-]
+CORS_ALLOWED_ORIGINS = os.environ.get(
+    "CORS_ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+).split(",")
 CORS_ALLOW_CREDENTIALS = True
 
 # REST Framework settings
@@ -157,27 +157,40 @@ REST_FRAMEWORK = {
 }
 
 # Cache settings
-CACHES = {
-    'default': {
-        'BACKEND': 'django_redis.cache.RedisCache',
-        'LOCATION': 'redis://127.0.0.1:6379/1',
-        'OPTIONS': {
-            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
-            'SOCKET_CONNECT_TIMEOUT': 5,
-            'SOCKET_TIMEOUT': 5,
-            'RETRY_ON_TIMEOUT': True,
-            'MAX_CONNECTIONS': 1000,
-            'COMPRESSOR_CLASS': 'django_redis.compressors.zlib.ZlibCompressor',
-            'COMPRESSOR_CLASS_KWARGS': {
-                'level': 5,
+# Uses Redis when REDIS_URL is set (e.g. redis://127.0.0.1:6379/1),
+# otherwise falls back to an in-process cache so Redis isn't required locally.
+REDIS_URL = os.environ.get("REDIS_URL")
+
+if REDIS_URL:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django_redis.cache.RedisCache',
+            'LOCATION': REDIS_URL,
+            'OPTIONS': {
+                'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+                'SOCKET_CONNECT_TIMEOUT': 5,
+                'SOCKET_TIMEOUT': 5,
+                'RETRY_ON_TIMEOUT': True,
+                'MAX_CONNECTIONS': 1000,
+                'COMPRESSOR_CLASS': 'django_redis.compressors.zlib.ZlibCompressor',
+                'COMPRESSOR_CLASS_KWARGS': {
+                    'level': 5,
+                },
+                'IGNORE_EXCEPTIONS': True,
             },
-            'IGNORE_EXCEPTIONS': True,
-        },
-        'KEY_PREFIX': 'oasis',
-        'TIMEOUT': 60 * 60,  # 1 hour
+            'KEY_PREFIX': 'oasis',
+            'TIMEOUT': 60 * 60,  # 1 hour
+        }
     }
-}
+else:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+            'LOCATION': 'oasis',
+            'TIMEOUT': 60 * 60,  # 1 hour
+        }
+    }
 
 # Session settings
-SESSION_ENGINE = 'django.contrib.sessions.backends.cache'
-SESSION_CACHE_ALIAS = 'default'
+# Store sessions in the DB so they survive restarts when Redis isn't in use
+SESSION_ENGINE = 'django.contrib.sessions.backends.cached_db'

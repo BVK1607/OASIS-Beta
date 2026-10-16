@@ -29,6 +29,16 @@ class TaskQueue:
             })
             if not self._running:
                 self._start_processing()
+
+    def add_live_prices_task(self, portfolio_id: int):
+        """Add a task to refresh current prices for a portfolio's holdings"""
+        with self._lock:
+            self._queue.append({
+                'type': 'live_prices',
+                'portfolio_id': portfolio_id,
+            })
+            if not self._running:
+                self._start_processing()
                 
     def _process_historical_data_task(self, task):
         """Process a historical data update task"""
@@ -63,14 +73,15 @@ class TaskQueue:
             if task['type'] == 'historical_data':
                 self._process_historical_data_task(task)
             elif task['type'] == 'live_prices':
-                self._process_live_prices_task(task)
+                self._process_live_prices_task(task['portfolio_id'])
         except Exception as e:
             logger.error(f"Error processing task: {e}")
             
     def _start_processing(self):
-        """Start processing tasks in the background"""
+        """Start processing tasks in the background (caller holds self._lock)"""
+        self._running = True
+
         def process_loop():
-            self._running = True
             while True:
                 with self._lock:
                     if not self._queue:
@@ -283,8 +294,7 @@ class TaskQueue:
     def _process_live_prices_task(self, portfolio_id):
         """Process live price updates for a portfolio"""
         try:
-            from .models import Portfolio
-            from django.db import connection
+            from .models import Portfolio, Holding
             
             portfolio = Portfolio.objects.get(id=portfolio_id)
             logger.info(f"Processing live prices for portfolio {portfolio_id}")
@@ -312,12 +322,11 @@ class TaskQueue:
                             price = Decimal(str(current_price))
                             market_value = price * holding.quantity
                             
-                            # Use direct SQL update to avoid locking
-                            with connection.cursor() as cursor:
-                                cursor.execute(
-                                    "UPDATE portfolio_holding SET current_price = %s, market_value = %s, last_price_update = NOW(), name = %s WHERE id = %s",
-                                    [price, market_value, stock.info.get('shortName', holding.name), holding.id]
-                                )
+                            # Queryset update skips save() signals and keeps the write short
+                            Holding.objects.filter(id=holding.id).update(
+                                current_price=price,
+                                market_value=market_value,
+                            )
                     except Exception as e:
                         logger.error(f"Error updating price for {holding.ticker}: {e}")
                         continue

@@ -22,16 +22,27 @@ OASIS is a full-stack web application for portfolio management and investment an
 - Frontend: React + Material-UI
 - Data: yfinance API for market data
 
+## Project Structure
+
+```
+backend/     Django project (API, models, management commands)
+  backend/   Settings and root URLs
+  portfolio/ Holdings, NAV, returns, market data
+  learning/  Learning resources
+  analytics/ Analytics app (placeholder)
+frontend/    React app (git submodule, see note below)
+```
+
 ## Setup
 
-### Backend Setup
+### Backend
 
-1. Navigate to the backend directory:
+1. Go to the backend directory:
    ```bash
-   cd oasis_backend
+   cd backend
    ```
 
-2. Create a virtual environment (optional but recommended):
+2. Create and activate a virtual environment:
    ```bash
    python -m venv venv
    source venv/bin/activate  # On Windows: venv\Scripts\activate
@@ -42,22 +53,47 @@ OASIS is a full-stack web application for portfolio management and investment an
    pip install -r requirements.txt
    ```
 
-4. Run migrations:
+4. Apply migrations (they're already committed, so no `makemigrations` needed):
    ```bash
-   python manage.py makemigrations
    python manage.py migrate
    ```
 
-5. Start the Django development server:
+5. Start the development server:
    ```bash
    python manage.py runserver
    ```
 
-### Frontend Setup
+#### Environment variables
 
-1. Navigate to the frontend directory:
+All are optional for local development.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DJANGO_SECRET_KEY` | dev-only placeholder | **Set this in any deployed environment** |
+| `DJANGO_DEBUG` | `True` | Set to `False` in production |
+| `DJANGO_ALLOWED_HOSTS` | `localhost,127.0.0.1` | Comma-separated hostnames |
+| `CORS_ALLOWED_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | Comma-separated frontend origins |
+| `REDIS_URL` | unset (in-memory cache) | e.g. `redis://127.0.0.1:6379/1` to use Redis |
+
+#### Running tests
+
+```bash
+python manage.py test
+```
+
+Some tests call Yahoo Finance and can fail when it rate-limits requests.
+
+#### Scheduled jobs
+
+`backend/crontab` has example cron entries for refreshing NAV and benchmark data. Replace `/path/to/backend` with your actual path.
+
+### Frontend
+
+> **Note:** `frontend/` is recorded as a git submodule, but the repo has no `.gitmodules` file, so a fresh clone gets an empty folder. To fix this, add the frontend repo as a proper submodule (`git submodule add <frontend-repo-url> frontend`) or commit the frontend code directly.
+
+1. Go to the frontend directory:
    ```bash
-   cd oasis_frontend
+   cd frontend
    ```
 
 2. Install dependencies:
@@ -93,4 +129,4 @@ The CSV file for uploading holdings should have the following columns:
 - Quantity
 - Book Cost
 - Currency
-- Trade Date (YYYY-MM-DD format) 
+- Trade Date (YYYY-MM-DD format)
