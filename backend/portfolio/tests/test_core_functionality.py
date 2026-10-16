@@ -116,11 +116,11 @@ class CorePortfolioTests(TestCase):
         self.holding2.save()
         
         # Calculate NAV
-        nav = PortfolioNAV.objects.create(
+        # Holding signals may already have created today's NAV, so upsert
+        nav, _ = PortfolioNAV.objects.update_or_create(
             portfolio=self.portfolio,
             date=date.today(),
-            total_value=Decimal("2500.00"),
-            nav=Decimal("2500.00")
+            defaults={"total_value": Decimal("2500.00"), "nav": Decimal("2500.00")}
         )
         
         self.assertEqual(nav.total_value, Decimal("2500.00"))
@@ -131,11 +131,10 @@ class CorePortfolioTests(TestCase):
         # Create NAV records for the last 5 days
         for i in range(5):
             d = date.today() - timedelta(days=i)
-            nav = PortfolioNAV.objects.create(
+            nav, _ = PortfolioNAV.objects.update_or_create(
                 portfolio=self.portfolio,
                 date=d,
-                total_value=Decimal("2500.00"),
-                nav=Decimal("2500.00")
+                defaults={"total_value": Decimal("2500.00"), "nav": Decimal("2500.00")}
             )
             self.assertEqual(nav.total_value, Decimal("2500.00"))
             self.assertEqual(nav.nav, Decimal("2500.00"))
